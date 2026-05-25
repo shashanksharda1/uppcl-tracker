@@ -91,11 +91,10 @@ class UPPCLGoogleSheetsTracker:
                 logger.info("[*] Using system Chrome (GitHub Actions environment)")
                 chrome_options.binary_location = '/opt/hostedtoolcache/setup-chrome/chromium/1635668/x64/chrome'
                 
-                # Use system chromedriver
-                self.driver = webdriver.Chrome(
-                    '/usr/local/bin/chromedriver',
-                    options=chrome_options
-                )
+                # Use system chromedriver (pass as service parameter, not positional)
+                from selenium.webdriver.chrome.service import Service
+                service = Service('/usr/local/bin/chromedriver')
+                self.driver = webdriver.Chrome(service=service, options=chrome_options)
             else:
                 # Local development - use webdriver-manager
                 from webdriver_manager.chrome import ChromeDriverManager
