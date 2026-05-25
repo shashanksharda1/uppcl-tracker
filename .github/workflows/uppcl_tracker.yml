@@ -1,8 +1,9 @@
-name: UPPCL Tracker - Hourly Schedule
+name: UPPCL Tracker - Hourly at Minute 2
 
 on:
   schedule:
-    - cron: '5 * * * *'
+    # Run at minute 2 of every hour (00:02, 01:02, 02:02, etc.)
+    - cron: '2 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -29,7 +30,7 @@ jobs:
       
       - name: Run UPPCL Tracker
         run: |
-          python uppcl_google_sheets_tracker_v3_6.py --once
+          python uppcl_google_sheets_tracker_v3_8.py --once
         env:
           UPPCL_USERNAME: ${{ secrets.UPPCL_USERNAME }}
           UPPCL_PASSWORD: ${{ secrets.UPPCL_PASSWORD }}
