@@ -588,5 +588,33 @@ def main():
     if args.once:
         tracker.run_once()
 
+def run_tracker():
+    """Run the tracker once"""
+    try:
+        logger.info("[*] UPPCL Tracker v3.8 - Enhanced with Hourly Benchmarking")
+        
+        tracker = UPPCLEnhancedTracker(
+            os.getenv('UPPCL_USERNAME'),
+            os.getenv('UPPCL_PASSWORD'),
+            os.getenv('GOOGLE_SHEETS_NAME', 'UPPCL Consumption Tracker'),
+            None  # Service account from environment variable now
+        )
+        
+        tracker.init_google_sheets()
+        success = tracker.run_once()
+        return success
+        
+    except Exception as e:
+        logger.error(f"[!] Error: {e}")
+        return False
+
 if __name__ == '__main__':
-    main()
+    port = int(os.getenv('PORT', 0))
+    
+    if port > 0:
+        # Cloud Run mode - start Flask server
+        logger.info(f"[*] Starting Flask server on port {port}")
+        app.run(host='0.0.0.0', port=port, debug=False)
+    else:
+        # Local mode - run once
+        run_tracker()
