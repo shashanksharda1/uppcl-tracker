@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker v3.10 - OCR CAPTCHA READING
-Uses pytesseract to extract text from captcha image
+UPPCL Tracker v4.1 - UNIVERSAL CAPTCHA SOLVER
+Handles: plain text, random chars, math problems
+Uses multiple extraction methods to find the answer
 """
 import json
 import os
@@ -9,8 +10,6 @@ import logging
 import time
 import re
 import subprocess
-import base64
-from io import BytesIO
 from datetime import datetime, timedelta
 
 from flask import Flask, jsonify
@@ -24,13 +23,6 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from bs4 import BeautifulSoup
-
-try:
-    from PIL import Image
-    import pytesseract
-    PYTESSERACT_AVAILABLE = True
-except ImportError:
-    PYTESSERACT_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -152,76 +144,121 @@ class UPPCLTracker:
             logger.error(f"[!] WebDriver error: {e}")
             raise
 
-    def read_captcha_from_image(self):
-        """Try to read captcha using OCR"""
+    def extract_captcha_answer(self):
+        """
+        UNIVERSAL: Extract captcha answer - handles all types
+        1. Check data-answer attribute (if server provides it)
+        2. Extract displayed text (for text/math captchas)
+        3. Check alt text or title attributes
+        """
+        logger.info("[*] Extracting captcha answer (universal method)...")
+        
         try:
-            if not PYTESSERACT_AVAILABLE:
-                logger.warning("[*] PIL/pytesseract not available, skipping OCR")
-                return None
+            captcha_div = self.driver.find_element(By.ID, "captchaText")
             
-            logger.info("[*] Attempting OCR captcha reading...")
+            # Method 1: data-answer attribute (some versions provide this)
+            data_answer = captcha_div.get_attribute('data-answer')
+            if data_answer and data_answer.strip():
+                logger.info(f"[+] Method 1 (data-answer): '{data_answer}'")
+                return data_answer.strip()
             
-            captcha_img = self.driver.find_element(By.ID, "captchaText")
+            # Method 2: textContent via JavaScript (for displayed text)
+            text_via_js = self.driver.execute_script(
+                "return document.getElementById('captchaText').textContent.trim();"
+            )
+            if text_via_js and text_via_js.strip():
+                logger.info(f"[+] Method 2 (textContent): '{text_via_js}'")
+                return text_via_js.strip()
             
-            # Try to get screenshot of captcha element
-            screenshot = captcha_img.screenshot_as_png
+            # Method 3: innerText via JavaScript
+            inner_text = self.driver.execute_script(
+                "return document.getElementById('captchaText').innerText.trim();"
+            )
+            if inner_text and inner_text.strip():
+                logger.info(f"[+] Method 3 (innerText): '{inner_text}'")
+                return inner_text.strip()
             
-            # Convert to PIL Image
-            img = Image.open(BytesIO(screenshot))
+            # Method 4: Check data attributes
+            for attr in ['data-answer', 'data-captcha', 'value', 'title', 'alt']:
+                val = captcha_div.get_attribute(attr)
+                if val and val.strip():
+                    logger.info(f"[+] Method 4 (attr {attr}): '{val}'")
+                    return val.strip()
             
-            # Try OCR
-            captcha_text = pytesseract.image_to_string(img).strip()
+            # Method 5: Get all attributes and check them
+            all_attrs = self.driver.execute_script(
+                "return Object.keys(document.getElementById('captchaText').attributes).map(i => document.getElementById('captchaText').attributes[i].name + '=' + document.getElementById('captchaText').getAttribute(document.getElementById('captchaText').attributes[i].name));"
+            )
+            logger.info(f"[DEBUG] All attributes: {all_attrs}")
             
-            logger.info(f"[DEBUG] OCR result: '{captcha_text}'")
-            
-            if captcha_text and len(captcha_text) > 0:
-                return captcha_text
-            
+            logger.warning("[*] Could not extract captcha answer using any method")
             return None
             
         except Exception as e:
-            logger.warning(f"[*] OCR reading failed: {e}")
+            logger.error(f"[!] Captcha extraction error: {e}")
             return None
 
+    def solve_captcha_math(self, captcha_text):
+        """
+        If captcha is a math problem, solve it
+        Examples: "2+3", "10-5", "2*3", "10/2"
+        """
+        try:
+            # Check if it's a math expression
+            if any(op in captcha_text for op in ['+', '-', '*', '/', '=']):
+                logger.info(f"[*] Detected math problem: '{captcha_text}'")
+                
+                # If it has '=', remove everything after it
+                if '=' in captcha_text:
+                    captcha_text = captcha_text.split('=')[0].strip()
+                    logger.info(f"[DEBUG] Extracted expression: '{captcha_text}'")
+                
+                try:
+                    # Safely evaluate the math expression
+                    result = eval(captcha_text)
+                    result = str(int(result)) if isinstance(result, float) and result.is_integer() else str(result)
+                    logger.info(f"[+] Math solved: {captcha_text} = {result}")
+                    return result
+                except Exception as e:
+                    logger.warning(f"[!] Could not solve math: {e}")
+                    return captcha_text
+            
+            return captcha_text
+            
+        except Exception as e:
+            logger.warning(f"[*] Math solving error: {e}")
+            return captcha_text
+
     def solve_captcha(self):
-        """Solve captcha - try attribute first, then OCR"""
+        """Solve captcha - universal method"""
         logger.info("[*] Solving captcha...")
         try:
-            captcha_div = WebDriverWait(self.driver, 3).until(
+            # Wait for captcha element
+            WebDriverWait(self.driver, 3).until(
                 EC.presence_of_element_located((By.ID, "captchaText"))
             )
-            
             logger.info("[+] Captcha element found")
             
-            # Try Method 1: data-answer attribute
-            data_answer = captcha_div.get_attribute('data-answer')
+            # Extract the answer
+            captcha_answer = self.extract_captcha_answer()
             
-            if data_answer and data_answer.strip():
-                logger.info(f"[+] Method 1 (data-answer): {data_answer}")
-                captcha_answer = data_answer
-            else:
-                # Try Method 2: OCR
-                logger.info("[*] data-answer empty, trying OCR...")
-                ocr_answer = self.read_captcha_from_image()
-                
-                if ocr_answer:
-                    logger.info(f"[+] Method 2 (OCR): {ocr_answer}")
-                    captcha_answer = ocr_answer
-                else:
-                    logger.warning("[*] Both methods failed, skipping captcha")
-                    return True
+            if not captcha_answer:
+                logger.warning("[*] No captcha answer found, continuing anyway...")
+                return True
             
-            # Send answer to input
-            logger.info(f"[*] Sending captcha answer: {captcha_answer}")
+            # Check if it's a math problem and solve it
+            final_answer = self.solve_captcha_math(captcha_answer)
             
+            logger.info(f"[+] Final captcha answer: '{final_answer}'")
+            
+            # Enter the answer
             captcha_input = self.driver.find_element(By.ID, "captchaInput")
             captcha_input.clear()
-            captcha_input.send_keys(captcha_answer)
+            captcha_input.send_keys(final_answer)
             
-            logger.info(f"[+] Sent captcha: {captcha_answer}")
+            logger.info(f"[+] ✓✓✓ SENT CAPTCHA: '{final_answer}'")
             
             # Wait for validation
-            logger.info("[*] Waiting 2 seconds for captcha validation...")
             time.sleep(2)
             
             return True
@@ -265,16 +302,16 @@ class UPPCLTracker:
             submit_button.click()
             logger.info("[*] Submit button clicked")
             
-            time.sleep(1)
+            time.sleep(2)
             
             try:
                 alert = WebDriverWait(self.driver, 1).until(EC.alert_is_present())
-                logger.warning(f"[*] Post-submit alert detected: {alert.text}")
+                logger.warning(f"[*] Post-submit alert: {alert.text}")
                 alert.dismiss()
-                logger.info("[*] Alert dismissed, retrying...")
+                logger.info("[*] Alert dismissed")
                 time.sleep(2)
             except:
-                logger.info("[*] No post-submit alert found")
+                logger.info("[*] No post-submit alert found - proceeding...")
 
             logger.info("[*] Waiting for chart to load...")
             WebDriverWait(self.driver, 15).until(
