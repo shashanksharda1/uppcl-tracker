@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker v3.9 - TIMING FIX FOR CAPTCHA
-Added delay and validation before submit
+UPPCL Tracker v3.10 - OCR CAPTCHA READING
+Uses pytesseract to extract text from captcha image
 """
 import json
 import os
@@ -9,6 +9,8 @@ import logging
 import time
 import re
 import subprocess
+import base64
+from io import BytesIO
 from datetime import datetime, timedelta
 
 from flask import Flask, jsonify
@@ -22,6 +24,13 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from bs4 import BeautifulSoup
+
+try:
+    from PIL import Image
+    import pytesseract
+    PYTESSERACT_AVAILABLE = True
+except ImportError:
+    PYTESSERACT_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -143,8 +152,39 @@ class UPPCLTracker:
             logger.error(f"[!] WebDriver error: {e}")
             raise
 
+    def read_captcha_from_image(self):
+        """Try to read captcha using OCR"""
+        try:
+            if not PYTESSERACT_AVAILABLE:
+                logger.warning("[*] PIL/pytesseract not available, skipping OCR")
+                return None
+            
+            logger.info("[*] Attempting OCR captcha reading...")
+            
+            captcha_img = self.driver.find_element(By.ID, "captchaText")
+            
+            # Try to get screenshot of captcha element
+            screenshot = captcha_img.screenshot_as_png
+            
+            # Convert to PIL Image
+            img = Image.open(BytesIO(screenshot))
+            
+            # Try OCR
+            captcha_text = pytesseract.image_to_string(img).strip()
+            
+            logger.info(f"[DEBUG] OCR result: '{captcha_text}'")
+            
+            if captcha_text and len(captcha_text) > 0:
+                return captcha_text
+            
+            return None
+            
+        except Exception as e:
+            logger.warning(f"[*] OCR reading failed: {e}")
+            return None
+
     def solve_captcha(self):
-        """Solve captcha and wait for validation"""
+        """Solve captcha - try attribute first, then OCR"""
         logger.info("[*] Solving captcha...")
         try:
             captcha_div = WebDriverWait(self.driver, 3).until(
@@ -153,30 +193,41 @@ class UPPCLTracker:
             
             logger.info("[+] Captcha element found")
             
+            # Try Method 1: data-answer attribute
             data_answer = captcha_div.get_attribute('data-answer')
             
-            logger.info(f"[DEBUG] data-answer: {data_answer}")
-            
             if data_answer and data_answer.strip():
-                logger.info(f"[+] Captcha answer found: {data_answer}")
-                
-                captcha_input = self.driver.find_element(By.ID, "captchaInput")
-                captcha_input.clear()
-                captcha_input.send_keys(data_answer)
-                
-                logger.info(f"[+] Sent captcha answer: {data_answer}")
-                
-                # FIXED: Wait longer for captcha validation to complete
-                logger.info("[*] Waiting 2 seconds for captcha validation...")
-                time.sleep(2)
-                
-                return True
+                logger.info(f"[+] Method 1 (data-answer): {data_answer}")
+                captcha_answer = data_answer
             else:
-                logger.warning("[*] Captcha element found but answer is empty")
-                return True
+                # Try Method 2: OCR
+                logger.info("[*] data-answer empty, trying OCR...")
+                ocr_answer = self.read_captcha_from_image()
+                
+                if ocr_answer:
+                    logger.info(f"[+] Method 2 (OCR): {ocr_answer}")
+                    captcha_answer = ocr_answer
+                else:
+                    logger.warning("[*] Both methods failed, skipping captcha")
+                    return True
+            
+            # Send answer to input
+            logger.info(f"[*] Sending captcha answer: {captcha_answer}")
+            
+            captcha_input = self.driver.find_element(By.ID, "captchaInput")
+            captcha_input.clear()
+            captcha_input.send_keys(captcha_answer)
+            
+            logger.info(f"[+] Sent captcha: {captcha_answer}")
+            
+            # Wait for validation
+            logger.info("[*] Waiting 2 seconds for captcha validation...")
+            time.sleep(2)
+            
+            return True
                 
         except Exception as e:
-            logger.warning(f"[*] Captcha not found or error: {e}")
+            logger.warning(f"[*] Captcha solve error: {e}")
             return True
 
     def login(self):
@@ -195,12 +246,9 @@ class UPPCLTracker:
             password_field.send_keys(self.password)
             logger.info("[*] Password entered")
 
-            # Solve captcha BEFORE dismissing any alerts
             self.solve_captcha()
             logger.info("[*] Captcha solve complete")
             
-            # CRITICAL: Dismiss ANY alert BEFORE clicking submit
-            logger.info("[*] Waiting 1 second, then checking for pre-submit alerts...")
             time.sleep(1)
             
             try:
@@ -212,13 +260,11 @@ class UPPCLTracker:
             except:
                 logger.info("[*] No pre-submit alert found")
 
-            # Now click submit
             logger.info("[*] Clicking submit button...")
             submit_button = self.driver.find_element(By.ID, "submitBtn")
             submit_button.click()
             logger.info("[*] Submit button clicked")
             
-            # Wait a moment, then check for post-submit alert
             time.sleep(1)
             
             try:
@@ -230,7 +276,6 @@ class UPPCLTracker:
             except:
                 logger.info("[*] No post-submit alert found")
 
-            # Wait for page to load
             logger.info("[*] Waiting for chart to load...")
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.ID, "chartContainerHourly"))
