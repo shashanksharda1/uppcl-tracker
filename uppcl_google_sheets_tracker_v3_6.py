@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker v3.8 - FINAL FIX FOR CAPTCHA
+UPPCL Tracker v3.9 - TIMING FIX FOR CAPTCHA
+Added delay and validation before submit
 """
 import json
 import os
@@ -143,7 +144,7 @@ class UPPCLTracker:
             raise
 
     def solve_captcha(self):
-        """FIXED: Handle captcha with correct method"""
+        """Solve captcha and wait for validation"""
         logger.info("[*] Solving captcha...")
         try:
             captcha_div = WebDriverWait(self.driver, 3).until(
@@ -152,7 +153,6 @@ class UPPCLTracker:
             
             logger.info("[+] Captcha element found")
             
-            # FIXED: Use .text property instead of get_text()
             data_answer = captcha_div.get_attribute('data-answer')
             
             logger.info(f"[DEBUG] data-answer: {data_answer}")
@@ -165,6 +165,11 @@ class UPPCLTracker:
                 captcha_input.send_keys(data_answer)
                 
                 logger.info(f"[+] Sent captcha answer: {data_answer}")
+                
+                # FIXED: Wait longer for captcha validation to complete
+                logger.info("[*] Waiting 2 seconds for captcha validation...")
+                time.sleep(2)
+                
                 return True
             else:
                 logger.warning("[*] Captcha element found but answer is empty")
@@ -190,21 +195,43 @@ class UPPCLTracker:
             password_field.send_keys(self.password)
             logger.info("[*] Password entered")
 
+            # Solve captcha BEFORE dismissing any alerts
             self.solve_captcha()
+            logger.info("[*] Captcha solve complete")
             
-            # Dismiss alerts
+            # CRITICAL: Dismiss ANY alert BEFORE clicking submit
+            logger.info("[*] Waiting 1 second, then checking for pre-submit alerts...")
+            time.sleep(1)
+            
             try:
-                alert = WebDriverWait(self.driver, 2).until(EC.alert_is_present())
-                logger.info("[*] Dismissing alert...")
+                alert = WebDriverWait(self.driver, 1).until(EC.alert_is_present())
+                logger.info("[*] Pre-submit alert detected, dismissing...")
                 alert.dismiss()
+                logger.info("[*] Alert dismissed")
                 time.sleep(1)
             except:
-                pass
+                logger.info("[*] No pre-submit alert found")
 
+            # Now click submit
+            logger.info("[*] Clicking submit button...")
             submit_button = self.driver.find_element(By.ID, "submitBtn")
             submit_button.click()
-            logger.info("[*] Submit clicked")
+            logger.info("[*] Submit button clicked")
+            
+            # Wait a moment, then check for post-submit alert
+            time.sleep(1)
+            
+            try:
+                alert = WebDriverWait(self.driver, 1).until(EC.alert_is_present())
+                logger.warning(f"[*] Post-submit alert detected: {alert.text}")
+                alert.dismiss()
+                logger.info("[*] Alert dismissed, retrying...")
+                time.sleep(2)
+            except:
+                logger.info("[*] No post-submit alert found")
 
+            # Wait for page to load
+            logger.info("[*] Waiting for chart to load...")
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.ID, "chartContainerHourly"))
             )
