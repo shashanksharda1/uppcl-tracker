@@ -28,6 +28,20 @@ from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
 from bs4 import BeautifulSoup
 
+from flask import Flask, jsonify
+
+app = Flask(__name__)
+
+@app.route('/', methods=['GET', 'POST'])
+def trigger():
+    """HTTP endpoint to trigger the tracker"""
+    logger.info("[*] HTTP request received - starting tracker...")
+    success = run_tracker()
+    
+    if success:
+        return jsonify({'status': 'success', 'message': 'Tracker executed successfully'}), 200
+    else:
+        return jsonify({'status': 'error', 'message': 'Tracker execution failed'}), 500
 # Setup logging
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +52,7 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger(__name__)
+
 
 class UPPCLEnhancedTracker:
     """Enhanced UPPCL tracker with hourly consumption and benchmarking"""
