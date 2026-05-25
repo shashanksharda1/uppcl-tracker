@@ -1,0 +1,10 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY uppcl_google_sheets_tracker_v3_6.py .
+
+# Run script (Cloud Run will call this)
+CMD ["python", "uppcl_google_sheets_tracker_v3_6.py", "--once"]
