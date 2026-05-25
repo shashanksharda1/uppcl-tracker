@@ -153,19 +153,34 @@ class UPPCLTracker:
 
     def solve_captcha(self):
         try:
-            logger.info("[*] Solving captcha...")
-            captcha_div = WebDriverWait(self.driver, 5).until(
-                EC.presence_of_element_located((By.ID, "captchaText"))
-            )
-            captcha_text = captcha_div.get_attribute('data-answer')
-            captcha_input = self.driver.find_element(By.ID, "captchaInput")
-            captcha_input.clear()
-            captcha_input.send_keys(captcha_text)
-            logger.info("[+] Captcha solved")
-            return True
+            logger.info("[*] Checking for captcha...")
+            
+            # Try to find and solve captcha
+            try:
+                captcha_div = WebDriverWait(self.driver, 3).until(
+                    EC.presence_of_element_located((By.ID, "captchaText"))
+                )
+                
+                captcha_text = captcha_div.get_attribute('data-answer')
+                
+                if captcha_text:
+                    logger.info(f"[+] Captcha answer found")
+                    captcha_input = self.driver.find_element(By.ID, "captchaInput")
+                    captcha_input.clear()
+                    captcha_input.send_keys(captcha_text)
+                    logger.info("[+] Captcha solved")
+                    return True
+                else:
+                    logger.info("[*] Captcha element found but no answer")
+                    return True
+                    
+            except:
+                logger.info("[*] No captcha needed or found, continuing...")
+                return True
+            
         except Exception as e:
-            logger.error(f"[!] Captcha error: {e}")
-            return False
+            logger.error(f"[!] Captcha handling error: {e}")
+            return True  # Continue anyway instead of failing
 
     def login(self):
         try:
@@ -181,6 +196,14 @@ class UPPCLTracker:
             password_field.send_keys(self.password)
 
             self.solve_captcha()
+            
+            # Try to dismiss any alerts
+            try:
+                alert = WebDriverWait(self.driver, 2).until(EC.alert_is_present())
+                logger.info("[*] Alert detected, dismissing...")
+                alert.dismiss()
+            except:
+                pass
 
             submit_button = self.driver.find_element(By.ID, "submitBtn")
             submit_button.click()
