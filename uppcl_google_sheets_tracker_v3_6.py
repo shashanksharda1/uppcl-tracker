@@ -7,7 +7,7 @@ UPPCL Tracker v3.8 - Enhanced with:
 - Multi-sheet organization (Today, This Month, Last Month)
 - Conditional formatting alerts for high consumption
 """
-
+import json
 import os
 import sys
 import logging
@@ -57,8 +57,15 @@ class UPPCLEnhancedTracker:
         
         try:
             # Load credentials with both required scopes
-            credentials = Credentials.from_service_account_file(
-                self.service_account_path,
+            # Load credentials from environment variable (Secret Manager)
+            service_account_json = os.environ.get('SERVICE_ACCOUNT_JSON')
+            if not service_account_json:
+                raise ValueError("SERVICE_ACCOUNT_JSON environment variable not set")
+
+            service_account_info = json.loads(service_account_json)
+
+            credentials = Credentials.from_service_account_info(
+                service_account_info,
                 scopes=[
                     'https://www.googleapis.com/auth/spreadsheets',
                     'https://www.googleapis.com/auth/drive'
