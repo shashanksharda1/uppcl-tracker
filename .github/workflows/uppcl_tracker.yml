@@ -3,7 +3,7 @@ name: UPPCL Tracker - Hourly at Minute 2
 on:
   schedule:
     # Run at minute 2 of every hour (00:02, 01:02, 02:02, etc.)
-    - cron: '2 * * * *'
+    - cron: '32 * * * *'
   workflow_dispatch:
 
 jobs:
