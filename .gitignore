@@ -3,3 +3,6 @@ __pycache__/
 *.log
 .DS_Store
 venv/
+service_account.json
+service_account.json
+service_account.json
