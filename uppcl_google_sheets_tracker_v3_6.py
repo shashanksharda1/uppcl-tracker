@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker v3.8 - Cloud Run Ready with Flask
+UPPCL Tracker v3.8 - With DETAILED CAPTCHA DEBUG LOGGING
 """
 import json
 import os
@@ -106,16 +106,9 @@ class UPPCLTracker:
 
     def _add_headers(self, worksheet):
         headers = [
-            'Timestamp',
-            'Hour',
-            'Current Day Units (kWh)',
-            'Hourly Consumption (kWh)',
-            'Last Hour Units (kWh)',
-            'Benchmark (3-day avg)',
-            'Above Benchmark?',
-            'Last Reading Time',
-            'Account Balance (Rs)',
-            'Source'
+            'Timestamp', 'Hour', 'Current Day Units (kWh)', 'Hourly Consumption (kWh)',
+            'Last Hour Units (kWh)', 'Benchmark (3-day avg)', 'Above Benchmark?',
+            'Last Reading Time', 'Account Balance (Rs)', 'Source'
         ]
         worksheet.append_row(headers)
         logger.info("[+] Headers added")
@@ -152,37 +145,76 @@ class UPPCLTracker:
             raise
 
     def solve_captcha(self):
+        """Handle captcha with DETAILED DEBUG LOGGING"""
+        logger.info("=" * 80)
+        logger.info("[CAPTCHA DEBUG] STARTING CAPTCHA SOLVE ATTEMPT")
+        logger.info("=" * 80)
+        
         try:
-            logger.info("[*] Checking for captcha...")
-            
-            # Try to find and solve captcha
             try:
+                logger.info("[CAPTCHA DEBUG] Waiting for captcha element with ID 'captchaText'...")
                 captcha_div = WebDriverWait(self.driver, 3).until(
                     EC.presence_of_element_located((By.ID, "captchaText"))
                 )
                 
-                captcha_text = captcha_div.get_attribute('data-answer')
+                logger.info("[CAPTCHA DEBUG] ✓ Captcha element FOUND")
                 
-                if captcha_text:
-                    logger.info(f"[+] Captcha answer found")
-                    captcha_input = self.driver.find_element(By.ID, "captchaInput")
-                    captcha_input.clear()
-                    captcha_input.send_keys(captcha_text)
-                    logger.info("[+] Captcha solved")
+                # Try all possible ways to get the answer
+                logger.info("[CAPTCHA DEBUG] Checking all attributes...")
+                
+                data_answer = captcha_div.get_attribute('data-answer')
+                text_content = captcha_div.get_text()
+                value_attr = captcha_div.get_attribute('value')
+                inner_html = captcha_div.get_attribute('innerHTML')
+                outer_html = captcha_div.get_attribute('outerHTML')
+                
+                logger.info(f"[CAPTCHA DEBUG] data-answer attribute: '{data_answer}'")
+                logger.info(f"[CAPTCHA DEBUG] text content: '{text_content}'")
+                logger.info(f"[CAPTCHA DEBUG] value attribute: '{value_attr}'")
+                logger.info(f"[CAPTCHA DEBUG] innerHTML: '{inner_html}'")
+                logger.info(f"[CAPTCHA DEBUG] outerHTML (first 200 chars): '{outer_html[:200]}'")
+                
+                # Try to find the answer in any of these
+                captcha_answer = data_answer or value_attr or text_content
+                
+                if captcha_answer and captcha_answer.strip():
+                    logger.info(f"[CAPTCHA DEBUG] ✓✓✓ CAPTCHA ANSWER FOUND: '{captcha_answer}'")
+                    
+                    try:
+                        captcha_input = self.driver.find_element(By.ID, "captchaInput")
+                        logger.info("[CAPTCHA DEBUG] ✓ Captcha input field FOUND")
+                        
+                        captcha_input.clear()
+                        logger.info("[CAPTCHA DEBUG] ✓ Cleared captcha input")
+                        
+                        captcha_input.send_keys(str(captcha_answer))
+                        logger.info(f"[CAPTCHA DEBUG] ✓✓✓ SENT ANSWER TO INPUT: '{captcha_answer}'")
+                        
+                    except Exception as e:
+                        logger.error(f"[CAPTCHA DEBUG] ✗ Failed to input answer: {e}")
+                        
                     return True
                 else:
-                    logger.info("[*] Captcha element found but no answer")
+                    logger.warning("[CAPTCHA DEBUG] ✗ Captcha element found but NO ANSWER found in any attribute")
+                    logger.warning(f"[CAPTCHA DEBUG] data-answer was empty/null")
                     return True
                     
-            except:
-                logger.info("[*] No captcha needed or found, continuing...")
-                return True
+            except Exception as e:
+                logger.warning(f"[CAPTCHA DEBUG] ✗ Captcha element NOT found or error: {e}")
+                logger.warning("[CAPTCHA DEBUG] Will continue without solving...")
+            
+            return True
             
         except Exception as e:
-            logger.error(f"[!] Captcha handling error: {e}")
-            return True  # Continue anyway instead of failing
+            logger.error(f"[CAPTCHA DEBUG] ✗ Captcha handling FAILED: {e}")
+            return True
+        finally:
+            logger.info("=" * 80)
+            logger.info("[CAPTCHA DEBUG] CAPTCHA SOLVE ATTEMPT COMPLETED")
+            logger.info("=" * 80)
 
     def login(self):
+        """Login to UPPCL portal"""
         try:
             logger.info("[*] Logging in...")
             self.driver.get("https://uppclmp.myxenius.com/login.html")
@@ -191,32 +223,44 @@ class UPPCLTracker:
                 EC.presence_of_element_located((By.ID, "name"))
             )
             username_field.send_keys(self.username)
+            logger.info("[*] Username entered")
 
             password_field = self.driver.find_element(By.ID, "password")
             password_field.send_keys(self.password)
+            logger.info("[*] Password entered")
 
+            logger.info("[*] About to solve captcha...")
             self.solve_captcha()
+            logger.info("[*] Captcha solve attempt complete")
             
-            # Try to dismiss any alerts
+            # Dismiss any alert that appears
             try:
+                logger.info("[*] Checking for alerts...")
                 alert = WebDriverWait(self.driver, 2).until(EC.alert_is_present())
-                logger.info("[*] Alert detected, dismissing...")
+                logger.info("[*] ✓ Alert detected, dismissing...")
                 alert.dismiss()
+                logger.info("[*] ✓ Alert dismissed")
+                time.sleep(1)
             except:
-                pass
+                logger.info("[*] No alert found (this is OK)")
 
+            logger.info("[*] Clicking submit button...")
             submit_button = self.driver.find_element(By.ID, "submitBtn")
             submit_button.click()
+            logger.info("[*] Submit button clicked")
 
+            logger.info("[*] Waiting for chart to load...")
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.ID, "chartContainerHourly"))
             )
 
-            logger.info("[+] Login successful")
+            logger.info("[+] Login successful!")
             return True
 
         except Exception as e:
             logger.error(f"[!] Login error: {e}")
+            import traceback
+            logger.error(f"[!] Traceback: {traceback.format_exc()}")
             return False
 
     def extract_source(self):
@@ -357,16 +401,9 @@ class UPPCLTracker:
             above_benchmark = "YES" if benchmark and hourly_consumption > benchmark else "NO"
 
             row = [
-                ist_timestamp,
-                ist_hour,
-                current_units,
-                hourly_consumption,
-                last_hour_units,
-                benchmark if benchmark else "N/A",
-                above_benchmark,
-                last_reading,
-                balance,
-                source
+                ist_timestamp, ist_hour, current_units, hourly_consumption,
+                last_hour_units, benchmark if benchmark else "N/A", above_benchmark,
+                last_reading, balance, source
             ]
 
             today_ws = self.worksheets['today']
@@ -416,7 +453,6 @@ class UPPCLTracker:
     def run_once(self):
         try:
             logger.info("[*] Starting tracker...")
-
             self.setup_chrome_driver()
 
             if not self.login():
