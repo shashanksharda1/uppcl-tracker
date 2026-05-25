@@ -74,10 +74,12 @@ class UPPCLGoogleSheetsTracker:
             raise
     
     def setup_chrome_driver(self):
-        """Setup Chrome WebDriver - uses system Chrome on GitHub Actions"""
+        """Setup Chrome WebDriver - auto-detects Chrome and ChromeDriver"""
         logger.info("[*] Setting up Chrome WebDriver...")
         
         try:
+            import subprocess
+            
             # Chrome options for headless operation
             chrome_options = Options()
             chrome_options.add_argument('--headless')
@@ -88,30 +90,47 @@ class UPPCLGoogleSheetsTracker:
             
             # Check if running on GitHub Actions
             if os.getenv('USE_SYSTEM_CHROME') == 'true' or os.getenv('GITHUB_ACTIONS') == 'true':
-                logger.info("[*] Using system Chrome (GitHub Actions environment)")
+                logger.info("[*] GitHub Actions environment detected")
                 
-                # GitHub Actions pre-installed Chrome and ChromeDriver paths
-                chrome_bin = '/opt/hostedtoolcache/setup-chrome/chromium/1635668/x64/chrome'
-                chromedriver_bin = '/opt/hostedtoolcache/setup-chrome/chromium/1635668/x64/chromedriver'
+                # Find ChromeDriver using 'which' command
+                result = subprocess.run(['which', 'chromedriver'], capture_output=True, text=True)
+                if result.returncode != 0:
+                    raise Exception("ChromeDriver not found in PATH")
                 
-                # Check which chromedriver exists
-                if not os.path.exists(chromedriver_bin):
-                    # Fallback: use the one from nanasess/setup-chromedriver action
-                    import subprocess
-                    result = subprocess.run(['which', 'chromedriver'], capture_output=True, text=True)
-                    if result.returncode == 0:
-                        chromedriver_bin = result.stdout.strip()
-                        logger.info(f"[*] Found chromedriver at: {chromedriver_bin}")
-                    else:
-                        raise Exception("ChromeDriver not found!")
+                chromedriver_bin = result.stdout.strip()
+                logger.info(f"[*] Found chromedriver at: {chromedriver_bin}")
                 
-                chrome_options.binary_location = chrome_bin
+                # Find Chrome using 'which' command
+                chrome_result = subprocess.run(['which', 'google-chrome'], capture_output=True, text=True)
+                if chrome_result.returncode == 0:
+                    chrome_bin = chrome_result.stdout.strip()
+                    chrome_options.binary_location = chrome_bin
+                    logger.info(f"[*] Found Chrome at: {chrome_bin}")
+                else:
+                    # Try alternative Chrome locations on GitHub Actions
+                    chrome_paths = [
+                        '/opt/hostedtoolcache/setup-chrome/chromium/1635668/x64/chrome',
+                        '/usr/bin/google-chrome',
+                        '/usr/bin/chromium-browser',
+                        '/snap/bin/chromium'
+                    ]
+                    
+                    found = False
+                    for path in chrome_paths:
+                        if os.path.exists(path):
+                            chrome_options.binary_location = path
+                            logger.info(f"[*] Found Chrome at: {path}")
+                            found = True
+                            break
+                    
+                    if not found:
+                        logger.warning("[!] Chrome binary not found, letting Selenium use default")
                 
                 # Use system chromedriver
                 from selenium.webdriver.chrome.service import Service
                 service = Service(chromedriver_bin)
                 self.driver = webdriver.Chrome(service=service, options=chrome_options)
-                logger.info(f"[+] Using chromedriver: {chromedriver_bin}")
+                logger.info("[+] Chrome WebDriver initialized (GitHub Actions)")
             else:
                 # Local development - use webdriver-manager
                 from webdriver_manager.chrome import ChromeDriverManager
@@ -119,8 +138,7 @@ class UPPCLGoogleSheetsTracker:
                 
                 service = Service(ChromeDriverManager().install())
                 self.driver = webdriver.Chrome(service=service, options=chrome_options)
-            
-            logger.info("[+] Chrome WebDriver initialized")
+                logger.info("[+] Chrome WebDriver initialized (local)")
             
         except Exception as e:
             logger.error(f"[!] WebDriver error: {e}")
