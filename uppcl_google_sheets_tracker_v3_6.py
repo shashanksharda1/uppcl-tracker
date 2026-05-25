@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker v4.1 - UNIVERSAL CAPTCHA SOLVER
-Handles: plain text, random chars, math problems
-Uses multiple extraction methods to find the answer
+UPPCL Tracker v4.2 - FINAL WORKING VERSION
+CRITICAL FIX: Use data-answer FIRST (already solved!)
+Only extract & solve if data-answer is empty
 """
 import json
 import os
@@ -144,119 +144,61 @@ class UPPCLTracker:
             logger.error(f"[!] WebDriver error: {e}")
             raise
 
-    def extract_captcha_answer(self):
-        """
-        UNIVERSAL: Extract captcha answer - handles all types
-        1. Check data-answer attribute (if server provides it)
-        2. Extract displayed text (for text/math captchas)
-        3. Check alt text or title attributes
-        """
-        logger.info("[*] Extracting captcha answer (universal method)...")
-        
-        try:
-            captcha_div = self.driver.find_element(By.ID, "captchaText")
-            
-            # Method 1: data-answer attribute (some versions provide this)
-            data_answer = captcha_div.get_attribute('data-answer')
-            if data_answer and data_answer.strip():
-                logger.info(f"[+] Method 1 (data-answer): '{data_answer}'")
-                return data_answer.strip()
-            
-            # Method 2: textContent via JavaScript (for displayed text)
-            text_via_js = self.driver.execute_script(
-                "return document.getElementById('captchaText').textContent.trim();"
-            )
-            if text_via_js and text_via_js.strip():
-                logger.info(f"[+] Method 2 (textContent): '{text_via_js}'")
-                return text_via_js.strip()
-            
-            # Method 3: innerText via JavaScript
-            inner_text = self.driver.execute_script(
-                "return document.getElementById('captchaText').innerText.trim();"
-            )
-            if inner_text and inner_text.strip():
-                logger.info(f"[+] Method 3 (innerText): '{inner_text}'")
-                return inner_text.strip()
-            
-            # Method 4: Check data attributes
-            for attr in ['data-answer', 'data-captcha', 'value', 'title', 'alt']:
-                val = captcha_div.get_attribute(attr)
-                if val and val.strip():
-                    logger.info(f"[+] Method 4 (attr {attr}): '{val}'")
-                    return val.strip()
-            
-            # Method 5: Get all attributes and check them
-            all_attrs = self.driver.execute_script(
-                "return Object.keys(document.getElementById('captchaText').attributes).map(i => document.getElementById('captchaText').attributes[i].name + '=' + document.getElementById('captchaText').getAttribute(document.getElementById('captchaText').attributes[i].name));"
-            )
-            logger.info(f"[DEBUG] All attributes: {all_attrs}")
-            
-            logger.warning("[*] Could not extract captcha answer using any method")
-            return None
-            
-        except Exception as e:
-            logger.error(f"[!] Captcha extraction error: {e}")
-            return None
-
-    def solve_captcha_math(self, captcha_text):
-        """
-        If captcha is a math problem, solve it
-        Examples: "2+3", "10-5", "2*3", "10/2"
-        """
-        try:
-            # Check if it's a math expression
-            if any(op in captcha_text for op in ['+', '-', '*', '/', '=']):
-                logger.info(f"[*] Detected math problem: '{captcha_text}'")
-                
-                # If it has '=', remove everything after it
-                if '=' in captcha_text:
-                    captcha_text = captcha_text.split('=')[0].strip()
-                    logger.info(f"[DEBUG] Extracted expression: '{captcha_text}'")
-                
-                try:
-                    # Safely evaluate the math expression
-                    result = eval(captcha_text)
-                    result = str(int(result)) if isinstance(result, float) and result.is_integer() else str(result)
-                    logger.info(f"[+] Math solved: {captcha_text} = {result}")
-                    return result
-                except Exception as e:
-                    logger.warning(f"[!] Could not solve math: {e}")
-                    return captcha_text
-            
-            return captcha_text
-            
-        except Exception as e:
-            logger.warning(f"[*] Math solving error: {e}")
-            return captcha_text
-
     def solve_captcha(self):
-        """Solve captcha - universal method"""
+        """
+        FINAL FIX: Use data-answer FIRST (server already solved it!)
+        Only extract & solve if data-answer is empty
+        """
         logger.info("[*] Solving captcha...")
         try:
-            # Wait for captcha element
-            WebDriverWait(self.driver, 3).until(
+            captcha_div = WebDriverWait(self.driver, 3).until(
                 EC.presence_of_element_located((By.ID, "captchaText"))
             )
+            
             logger.info("[+] Captcha element found")
             
-            # Extract the answer
-            captcha_answer = self.extract_captcha_answer()
+            # FIRST: Try data-answer (server pre-solved answer)
+            data_answer = captcha_div.get_attribute('data-answer')
             
-            if not captcha_answer:
-                logger.warning("[*] No captcha answer found, continuing anyway...")
-                return True
-            
-            # Check if it's a math problem and solve it
-            final_answer = self.solve_captcha_math(captcha_answer)
-            
-            logger.info(f"[+] Final captcha answer: '{final_answer}'")
+            if data_answer and data_answer.strip():
+                logger.info(f"[+] ✓✓✓ USING data-answer (PRE-SOLVED): '{data_answer}'")
+                captcha_answer = data_answer.strip()
+            else:
+                # FALLBACK: Extract displayed text and try to solve it
+                logger.info("[*] data-answer empty, extracting displayed text...")
+                
+                text_via_js = self.driver.execute_script(
+                    "return document.getElementById('captchaText').textContent.trim();"
+                )
+                
+                if text_via_js and text_via_js.strip():
+                    logger.info(f"[+] Extracted text: '{text_via_js}'")
+                    
+                    # Check if it's math and solve
+                    if any(op in text_via_js for op in ['+', '-', '*', '/']):
+                        logger.info("[*] Detected math expression, solving...")
+                        expression = text_via_js.split('=')[0].strip()
+                        try:
+                            result = eval(expression)
+                            captcha_answer = str(int(result)) if isinstance(result, float) and result.is_integer() else str(result)
+                            logger.info(f"[+] Math solved: {expression} = {captcha_answer}")
+                        except Exception as e:
+                            logger.warning(f"[!] Math solve failed: {e}, using text as-is")
+                            captcha_answer = text_via_js
+                    else:
+                        captcha_answer = text_via_js
+                else:
+                    logger.warning("[*] Could not extract captcha text")
+                    return True
             
             # Enter the answer
+            logger.info(f"[+] Final answer to send: '{captcha_answer}'")
+            
             captcha_input = self.driver.find_element(By.ID, "captchaInput")
             captcha_input.clear()
-            captcha_input.send_keys(final_answer)
+            captcha_input.send_keys(captcha_answer)
             
-            logger.info(f"[+] ✓✓✓ SENT CAPTCHA: '{final_answer}'")
+            logger.info(f"[+] ✓✓✓ SENT CAPTCHA: '{captcha_answer}'")
             
             # Wait for validation
             time.sleep(2)
