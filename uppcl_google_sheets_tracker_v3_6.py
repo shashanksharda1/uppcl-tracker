@@ -1,27 +1,26 @@
 #!/usr/bin/env python3
 """
-UPPCL Hourly Tracker v3.6
-FIXED: Works with Highcharts (not ApexCharts)
-Extracts current day units directly from the chart data
+UPPCL Tracker v3.7 - Fixed for GitHub Actions
+Uses system Chrome and ChromeDriver (pre-installed on GitHub Actions)
 """
 
-import time
-from datetime import datetime, timedelta
-import logging
-import re
 import os
+import sys
+import logging
+import time
+import re
+from datetime import datetime
+from pathlib import Path
 
+import gspread
+from google.auth.transport.requests import Request
+from google.oauth2.service_account import Credentials
 from selenium import webdriver
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.service import Service
-from selenium.webdriver.common.action_chains import ActionChains
-from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.options import Options
 from bs4 import BeautifulSoup
-
-import gspread
-from google.oauth2.service_account import Credentials
 
 # Setup logging
 logging.basicConfig(
@@ -34,548 +33,314 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-
 class UPPCLGoogleSheetsTracker:
-    def __init__(
-        self,
-        username,
-        password,
-        google_sheets_name='UPPCL Consumption Tracker',
-        service_account_json=None
-    ):
+    """UPPCL tracker with Google Sheets integration - GitHub Actions compatible"""
+    
+    def __init__(self, username, password, sheet_name, service_account_path):
         self.username = username
         self.password = password
-        self.google_sheets_name = google_sheets_name
-        self.service_account_json = service_account_json or 'service_account.json'
-        
-        self.base_url = "https://uppclmp.myxenius.com/login.html"
-        self.home_url = "https://uppclmp.myxenius.com/AppAMR"
+        self.sheet_name = sheet_name
+        self.service_account_path = service_account_path
+        self.gs = None
+        self.worksheet = None
         self.driver = None
-        self.sheet = None
         
-        logger.info(f"[*] UPPCL Tracker v3.6 - Highcharts Support")
-        self.init_google_sheets()
-    
     def init_google_sheets(self):
-        """Initialize Google Sheets connection"""
+        """Initialize Google Sheets connection with correct scopes"""
+        logger.info("[*] Initializing Google Sheets...")
+        
         try:
-            logger.info("[*] Initializing Google Sheets...")
-            
-            if not os.path.exists(self.service_account_json):
-                logger.error(f"[!] Service account file not found: {self.service_account_json}")
-                return False
-            
+            # Load credentials with BOTH required scopes
             credentials = Credentials.from_service_account_file(
-                self.service_account_json,
+                self.service_account_path,
                 scopes=[
                     'https://www.googleapis.com/auth/spreadsheets',
                     'https://www.googleapis.com/auth/drive'
                 ]
             )
             
+            # Refresh credentials
+            credentials.refresh(Request())
             logger.info("[+] Credentials created with correct scopes")
-            client = gspread.authorize(credentials)
             
-            try:
-                self.spreadsheet = client.open(self.google_sheets_name)
-                logger.info(f"[+] Opened spreadsheet: {self.google_sheets_name}")
-            except gspread.SpreadsheetNotFound:
-                logger.error(f"[!] Google Sheet not found: {self.google_sheets_name}")
-                return False
-            
-            try:
-                self.sheet = self.spreadsheet.worksheet('Hourly Data')
-            except gspread.WorksheetNotFound:
-                logger.info("[*] Creating worksheet: Hourly Data")
-                self.sheet = self.spreadsheet.add_worksheet(title='Hourly Data', rows=10000, cols=5)
-                headers = ['Timestamp', 'Source', 'Current Day Units (kWh)', 'Last Reading Time', 'Account Balance (₹)']
-                self.sheet.append_row(headers)
-                logger.info("[+] Added headers to sheet")
-            
+            # Authorize and open spreadsheet
+            self.gs = gspread.authorize(credentials)
+            self.worksheet = self.gs.open(self.sheet_name).sheet1
+            logger.info(f"[+] Opened spreadsheet: {self.sheet_name}")
             logger.info("[+] Google Sheets ready!")
-            return True
+            
         except Exception as e:
             logger.error(f"[!] Google Sheets error: {e}")
-            return False
+            raise
     
-    def setup_driver(self, headless=False):
-        """Setup Chrome WebDriver"""
+    def setup_chrome_driver(self):
+        """Setup Chrome WebDriver - uses system Chrome on GitHub Actions"""
+        logger.info("[*] Setting up Chrome WebDriver...")
+        
         try:
-            logger.info("[*] Setting up Chrome WebDriver...")
-            options = webdriver.ChromeOptions()
+            # Chrome options for headless operation
+            chrome_options = Options()
+            chrome_options.add_argument('--headless')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
             
-            if headless:
-                options.add_argument('--headless')
+            # Check if running on GitHub Actions
+            if os.getenv('USE_SYSTEM_CHROME') == 'true' or os.getenv('GITHUB_ACTIONS') == 'true':
+                logger.info("[*] Using system Chrome (GitHub Actions environment)")
+                chrome_options.binary_location = '/opt/hostedtoolcache/setup-chrome/chromium/1635668/x64/chrome'
+                
+                # Use system chromedriver
+                self.driver = webdriver.Chrome(
+                    '/usr/local/bin/chromedriver',
+                    options=chrome_options
+                )
+            else:
+                # Local development - use webdriver-manager
+                from webdriver_manager.chrome import ChromeDriverManager
+                from selenium.webdriver.chrome.service import Service
+                
+                service = Service(ChromeDriverManager().install())
+                self.driver = webdriver.Chrome(service=service, options=chrome_options)
             
-            options.add_argument('--no-sandbox')
-            options.add_argument('--disable-dev-shm-usage')
-            options.add_argument('--disable-gpu')
-            options.add_argument('--disable-blink-features=AutomationControlled')
-            options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+            logger.info("[+] Chrome WebDriver initialized")
             
-            service = Service(ChromeDriverManager().install())
-            self.driver = webdriver.Chrome(service=service, options=options)
-            logger.info("[+] WebDriver initialized")
-            return True
         except Exception as e:
             logger.error(f"[!] WebDriver error: {e}")
-            return False
+            raise
     
-    def handle_alert(self):
-        """Handle unexpected alerts"""
+    def solve_captcha(self):
+        """Solve login captcha"""
         try:
-            alert = self.driver.switch_to.alert
-            alert_text = alert.text
-            logger.warning(f"[!] Alert: {alert_text}")
-            alert.accept()
-            return True
-        except:
-            return False
-    
-    def solve_math_captcha(self, expression):
-        """Solve mathematical captcha"""
-        try:
-            match = re.search(r'(\d+)\s*([+\-*/])\s*(\d+)', expression)
-            if not match:
-                return None
+            logger.info("[*] Solving captcha...")
             
-            num1 = int(match.group(1))
-            operator = match.group(2)
-            num2 = int(match.group(3))
-            
-            if operator == '+': answer = num1 + num2
-            elif operator == '-': answer = num1 - num2
-            elif operator == '*': answer = num1 * num2
-            elif operator == '/': answer = int(num1 / num2)
-            else: return None
-            
-            logger.info(f"[+] Math: {num1} {operator} {num2} = {answer}")
-            return str(answer)
-        except Exception as e:
-            logger.warning(f"[!] Math solving error: {e}")
-            return None
-    
-    def solve_captcha_from_page(self):
-        """Read captcha from DOM"""
-        try:
-            logger.info("[*] Waiting for captcha element to render...")
-            
-            captcha_element = WebDriverWait(self.driver, 5).until(
-                EC.presence_of_element_located((By.XPATH, '//div[@id="captchaText"]'))
+            # Find captcha element
+            captcha_div = WebDriverWait(self.driver, 5).until(
+                EC.presence_of_element_located((By.ID, "captchaText"))
             )
-            logger.info("[+] Captcha element loaded")
-            time.sleep(1.5)
             
-            answer = captcha_element.get_attribute('data-answer')
+            captcha_text = captcha_div.get_attribute('data-answer')
+            logger.info(f"[+] Captcha answer extracted: {captcha_text}")
             
-            if answer:
-                answer = str(answer).strip()
-                displayed_text = captcha_element.text
-                logger.info(f"[*] Captcha display: '{displayed_text}'")
-                logger.info(f"[+] Captcha answer: {answer}")
-                
-                if '+' in displayed_text or '-' in displayed_text or '*' in displayed_text or '/' in displayed_text:
-                    logger.info("[*] Detected math captcha, solving...")
-                    math_answer = self.solve_math_captcha(displayed_text)
-                    if math_answer:
-                        logger.info(f"[+] Math solved: {math_answer}")
-                        return math_answer
-                
-                if answer and len(answer) >= 1:
-                    return answer
+            # Fill captcha input
+            captcha_input = self.driver.find_element(By.ID, "captchaInput")
+            captcha_input.clear()
+            captcha_input.send_keys(captcha_text)
             
-            logger.warning("[!] Could not read captcha answer")
-            return None
+            logger.info("[+] Captcha solved")
+            return True
+            
         except Exception as e:
-            logger.error(f"[!] Error reading captcha: {e}")
-            return None
-    
-    def find_captcha_input_field(self):
-        """Find captcha input field"""
-        try:
-            captcha_selectors = [
-                '//input[@id="captchaInput"]',
-                '//input[@placeholder="Enter Captcha"]',
-                '//input[@id="captcha"]',
-                '//input[@name="captcha"]',
-                '//input[@type="text"]',
-            ]
-            
-            for selector in captcha_selectors:
-                try:
-                    field = self.driver.find_element(By.XPATH, selector)
-                    if field and field.is_displayed():
-                        logger.info(f"[+] Found captcha input field")
-                        return field
-                except:
-                    continue
-            
-            logger.warning("[!] Could not find captcha input field")
-            return None
-        except Exception as e:
-            logger.error(f"[!] Error: {e}")
-            return None
+            logger.error(f"[!] Captcha error: {e}")
+            return False
     
     def login(self):
-        """Perform login"""
+        """Login to UPPCL portal"""
         try:
-            logger.info("[*] Navigating to login page...")
-            self.driver.get(self.base_url)
-            time.sleep(4)
+            logger.info("[*] Logging in...")
             
-            logger.info("[*] Entering credentials...")
+            self.driver.get("https://uppclmp.myxenius.com/login.html")
             
-            try:
-                username_field = self.driver.find_element(By.XPATH, '//input[@id="name"]')
-                username_field.clear()
-                username_field.send_keys(self.username)
-                logger.info(f"[+] Username entered")
-            except Exception as e:
-                logger.warning(f"[!] Username error: {e}")
+            # Enter credentials
+            username_field = WebDriverWait(self.driver, 10).until(
+                EC.presence_of_element_located((By.ID, "name"))
+            )
+            username_field.send_keys(self.username)
             
-            time.sleep(0.5)
-            try:
-                password_field = self.driver.find_element(By.XPATH, '//input[@id="password"]')
-                password_field.clear()
-                password_field.send_keys(self.password)
-                logger.info(f"[+] Password entered")
-            except Exception as e:
-                logger.warning(f"[!] Password error: {e}")
+            password_field = self.driver.find_element(By.ID, "password")
+            password_field.send_keys(self.password)
             
-            time.sleep(1)
-            logger.info("[*] Solving captcha...")
-            captcha_answer = self.solve_captcha_from_page()
+            # Solve and submit
+            self.solve_captcha()
             
-            if captcha_answer:
-                captcha_input = self.find_captcha_input_field()
-                if captcha_input:
-                    try:
-                        captcha_input.clear()
-                        captcha_input.send_keys(captcha_answer)
-                        logger.info(f"[+] Captcha entered: {captcha_answer}")
-                    except Exception as e:
-                        logger.warning(f"[!] Could not enter captcha: {e}")
-                else:
-                    logger.warning("[!] Could not find captcha input field")
-            else:
-                logger.warning("[!] Could not solve captcha")
+            submit_button = self.driver.find_element(By.ID, "submitBtn")
+            submit_button.click()
             
-            time.sleep(1)
-            logger.info("[*] Submitting login...")
+            # Wait for redirect to dashboard
+            WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.ID, "chartContainerHourly"))
+            )
             
-            submit_selectors = [
-                '//button[@id="submitBtn"]',
-                '//button[@type="submit"]',
-                '//button[contains(text(), "Submit")]',
-            ]
+            logger.info("[+] Login successful!")
+            return True
             
-            for selector in submit_selectors:
-                try:
-                    submit = self.driver.find_element(By.XPATH, selector)
-                    if submit and submit.is_enabled():
-                        self.driver.execute_script("arguments[0].scrollIntoView(true);", submit)
-                        time.sleep(0.3)
-                        submit.click()
-                        logger.info(f"[+] Submit button clicked")
-                        break
-                except:
-                    continue
-            
-            time.sleep(3)
-            
-            if self.handle_alert():
-                logger.warning("[!] Login failed - captcha was incorrect")
-                return False
-            
-            time.sleep(2)
-            
-            if 'login' not in self.driver.current_url.lower():
-                logger.info("[+] Login successful!")
-                return True
-            else:
-                logger.error("[!] Still on login page")
-                return False
         except Exception as e:
             logger.error(f"[!] Login error: {e}")
-            try:
-                alert = self.driver.switch_to.alert
-                alert.accept()
-            except:
-                pass
             return False
     
     def extract_source(self):
-        """Extract power source (Grid/DG/etc)"""
+        """Extract power source from heading"""
         try:
-            logger.info("[*] Extracting power source...")
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            h1 = soup.find('h1', class_='clearfix')
             
-            page_html = self.driver.page_source
-            soup = BeautifulSoup(page_html, 'html.parser')
-            
-            # Look for the overview heading that contains "Source : "
-            # Pattern: "Overview (Source : Grid ...)" or "Overview (Source : DG ...)"
-            h1_text = soup.find('h1', class_='clearfix')
-            
-            if h1_text:
-                text = h1_text.get_text()
-                logger.info(f"[*] Found heading: {text}")
-                
-                # Extract source using regex
+            if h1:
+                text = h1.get_text()
                 match = re.search(r'Source\s*:\s*(\w+)', text, re.IGNORECASE)
                 if match:
-                    source = match.group(1).strip()
+                    source = match.group(1)
                     logger.info(f"[+] Source: {source}")
                     return source
             
-            logger.warning("[!] Source not found")
-            return None
+            logger.warning("[!] Could not extract source")
+            return "Unknown"
+            
         except Exception as e:
-            logger.error(f"[!] Error: {e}")
-            return None
+            logger.error(f"[!] Source extraction error: {e}")
+            return "Unknown"
     
-    def extract_current_day_units(self):
-        """v3.6: Extract from Highcharts using JavaScript"""
+    def extract_units(self):
+        """Extract current day units from Highcharts"""
         try:
-            logger.info("[*] Extracting current day units (Highcharts)...")
+            day_of_month = datetime.now().day
             
-            today = datetime.now()
-            day_of_month = today.day
-            
-            # Wait for the chart container to exist
-            logger.info("[*] Waiting for chart container...")
-            WebDriverWait(self.driver, 5).until(
-                EC.presence_of_element_located((By.ID, 'chartContainerHourly'))
-            )
-            time.sleep(1.5)  # Wait for Highcharts to render
-            
-            # Method 1: Access Highcharts data via JavaScript
-            logger.info("[*] Accessing Highcharts data...")
+            # JavaScript to extract from Highcharts
             script = """
-            try {
-                // Access the Highcharts instance
-                var chart = Highcharts.charts[0] || Highcharts.charts.find(c => c && c.renderTo && c.renderTo.id === 'chartContainerHourly');
-                
-                if (chart && chart.series && chart.series.length > 0) {
-                    var seriesData = chart.series[0].data;
-                    var dayIndex = arguments[0] - 1;  // Convert day (1-31) to 0-based index
-                    
-                    if (seriesData && seriesData[dayIndex]) {
-                        return seriesData[dayIndex].y;  // Return the y-value (units)
-                    }
+            var chart = Highcharts.charts[0];
+            if (chart && chart.series && chart.series.length > 0) {
+                var seriesData = chart.series[0].data;
+                var dayIndex = arguments[0] - 1;
+                if (seriesData && seriesData[dayIndex]) {
+                    return seriesData[dayIndex].y;
                 }
-                return null;
-            } catch(e) {
-                return null;
             }
+            return null;
             """
             
             units = self.driver.execute_script(script, day_of_month)
             
-            if units is not None:
+            if units:
                 logger.info(f"[+] Extracted from Highcharts: {units} kWh")
                 return float(units)
-            else:
-                logger.warning("[!] Could not access Highcharts data")
             
-            # Method 2: Hover over the chart point and read tooltip
-            logger.info("[*] Trying hover method...")
+            logger.warning("[!] Could not extract units from chart")
+            return 0.0
             
-            # Find the SVG in the chart container
-            chart_container = self.driver.find_element(By.ID, 'chartContainerHourly')
-            svg = chart_container.find_element(By.TAG_NAME, 'svg')
-            
-            # Find all circles (data points) in the SVG
-            circles = svg.find_elements(By.TAG_NAME, 'circle')
-            logger.info(f"[+] Found {len(circles)} circles")
-            
-            if circles and len(circles) >= day_of_month:
-                # Hover over today's circle
-                target_circle = circles[day_of_month - 1]
-                
-                actions = ActionChains(self.driver)
-                actions.move_to_element(target_circle).perform()
-                time.sleep(1.5)
-                
-                # Look for tooltip (Highcharts uses .highcharts-tooltip)
-                try:
-                    tooltip = WebDriverWait(self.driver, 1).until(
-                        EC.presence_of_element_located((By.CLASS_NAME, 'highcharts-tooltip'))
-                    )
-                    
-                    tooltip_text = tooltip.text
-                    logger.info(f"[*] Tooltip: {tooltip_text}")
-                    
-                    # Extract the number from tooltip
-                    match = re.search(r'(\d+\.?\d*)', tooltip_text)
-                    if match:
-                        units = float(match.group(1))
-                        logger.info(f"[+] Extracted from tooltip: {units} kWh")
-                        return units
-                except:
-                    logger.warning("[!] Tooltip not found")
-            
-            logger.warning("[!] Could not extract units")
-            return None
-        
         except Exception as e:
-            logger.error(f"[!] Error: {e}")
-            return None
+            logger.error(f"[!] Units extraction error: {e}")
+            return 0.0
     
-    def extract_last_reading_time(self):
-        """Extract last reading timestamp"""
+    def extract_last_reading(self):
+        """Extract last reading time"""
         try:
-            logger.info("[*] Extracting last reading time...")
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            text = soup.get_text()
             
-            page_html = self.driver.page_source
-            soup = BeautifulSoup(page_html, 'html.parser')
-            page_text = soup.get_text()
-            
-            match = re.search(
-                r'Last\s+Reading\s+As\s+on\s+(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2})',
-                page_text,
-                re.IGNORECASE
-            )
-            
+            match = re.search(r'Last Reading As on (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', text)
             if match:
-                timestamp = match.group(1)
-                logger.info(f"[+] Last reading: {timestamp}")
-                return timestamp
+                reading_time = match.group(1)
+                logger.info(f"[+] Last reading: {reading_time}")
+                return reading_time
             
-            logger.warning("[!] Last reading time not found")
-            return None
+            logger.warning("[!] Could not extract last reading time")
+            return "N/A"
+            
         except Exception as e:
-            logger.error(f"[!] Error: {e}")
-            return None
+            logger.error(f"[!] Last reading extraction error: {e}")
+            return "N/A"
     
-    def extract_account_balance(self):
+    def extract_balance(self):
         """Extract account balance"""
         try:
-            logger.info("[*] Extracting account balance...")
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            text = soup.get_text()
             
-            page_html = self.driver.page_source
-            soup = BeautifulSoup(page_html, 'html.parser')
-            page_text = soup.get_text()
-            
-            match = re.search(
-                r'Updated\s+Balance\s*:\s*Grid\s+Bal\s*:\s*Rs\.\s*([\d,]+\.?\d*)',
-                page_text,
-                re.IGNORECASE
-            )
-            
+            match = re.search(r'Updated Balance\s*:\s*Grid Bal:\s*Rs\.\s*([\d,]+\.?\d*)', text)
             if match:
-                balance_str = match.group(1).replace(',', '')
-                balance = float(balance_str)
-                logger.info(f"[+] Balance: ₹{balance:.2f}")
+                balance = match.group(1)
+                logger.info(f"[+] Balance: ₹{balance}")
                 return balance
             
-            logger.warning("[!] Balance not found")
-            return None
+            logger.warning("[!] Could not extract balance")
+            return "N/A"
+            
         except Exception as e:
-            logger.error(f"[!] Error: {e}")
-            return None
+            logger.error(f"[!] Balance extraction error: {e}")
+            return "N/A"
     
-    def capture_and_save(self):
-        """Capture data and save"""
+    def add_row_to_sheets(self, timestamp, source, units, last_reading, balance):
+        """Add data row to Google Sheets"""
         try:
-            logger.info("\n" + "="*70)
-            logger.info(f"[CAPTURE] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            logger.info("="*70)
-            
-            source = self.extract_source()
-            units = self.extract_current_day_units()
-            last_reading = self.extract_last_reading_time()
-            balance = self.extract_account_balance()
-            
-            row = [
-                datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
-                source if source else 'N/A',
-                units if units is not None else 'N/A',
-                last_reading if last_reading else 'N/A',
-                f"₹{balance:.2f}" if balance is not None else 'N/A'
-            ]
-            
-            if not self.sheet:
-                logger.error("[!] Google Sheets not initialized")
-                return False
-            
-            self.sheet.append_row(row)
+            row = [timestamp, source, units, last_reading, balance]
+            self.worksheet.append_row(row)
             logger.info("[+] Row added to Google Sheets! ✅")
             
-            return True
         except Exception as e:
-            logger.error(f"[!] Error: {e}")
-            return False
+            logger.error(f"[!] Google Sheets append error: {e}")
     
     def run_once(self):
-        """Run single capture"""
+        """Run tracker once"""
         try:
-            if not self.setup_driver(headless=False):
-                return False
+            logger.info("[*] Running single capture...")
+            
+            self.setup_chrome_driver()
             
             if not self.login():
-                self.driver.quit()
+                logger.error("[!] Login failed")
                 return False
             
-            logger.info("[*] Navigating to home page...")
-            self.driver.get(self.home_url)
-            time.sleep(3)
+            # Wait for chart to load
+            time.sleep(2)
             
-            result = self.capture_and_save()
+            # Extract all metrics
+            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            source = self.extract_source()
+            units = self.extract_units()
+            last_reading = self.extract_last_reading()
+            balance = self.extract_balance()
             
-            self.driver.quit()
-            return result
+            # Add to sheets
+            self.add_row_to_sheets(timestamp, source, units, last_reading, balance)
+            
+            logger.info("[+] Single capture completed successfully!")
+            return True
+            
         except Exception as e:
-            logger.error(f"[!] Error: {e}")
-            if self.driver:
-                try:
-                    self.driver.quit()
-                except:
-                    pass
+            logger.error(f"[!] Error during capture: {e}")
             return False
+            
+        finally:
+            if self.driver:
+                self.driver.quit()
     
-    def run_continuous(self, interval_minutes=60):
-        """Run continuously"""
-        logger.info("="*70)
-        logger.info("UPPCL GOOGLE SHEETS TRACKER - CONTINUOUS MODE")
-        logger.info("="*70)
-        logger.info(f"Interval: {interval_minutes} minutes")
-        logger.info(f"Spreadsheet: {self.google_sheets_name}")
-        logger.info("="*70 + "\n")
+    def run_continuous(self, interval=60):
+        """Run tracker continuously"""
+        logger.info(f"[*] Starting continuous tracking every {interval} seconds...")
         
-        cycle = 0
         try:
             while True:
-                cycle += 1
-                logger.info(f"\n[CYCLE {cycle}] {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+                self.run_once()
+                logger.info(f"[*] Next capture in {interval} seconds...")
+                time.sleep(interval)
                 
-                if self.setup_driver(headless=True):
-                    if self.login():
-                        self.driver.get(self.home_url)
-                        time.sleep(3)
-                        self.capture_and_save()
-                    
-                    self.driver.quit()
-                
-                next_run = datetime.now() + timedelta(minutes=interval_minutes)
-                logger.info(f"[*] Next: {next_run.strftime('%Y-%m-%d %H:%M:%S')}")
-                time.sleep(interval_minutes * 60)
         except KeyboardInterrupt:
-            logger.info("\n[*] Tracker stopped")
-
+            logger.info("[*] Tracker stopped by user")
+        except Exception as e:
+            logger.error(f"[!] Continuous run error: {e}")
 
 def main():
     """Main entry point"""
     import argparse
     
-    parser = argparse.ArgumentParser(description='UPPCL Tracker v3.6 - Highcharts Support')
-    parser.add_argument('--username', default='5573683932', help='UPPCL username')
-    parser.add_argument('--password', default='5573683932', help='UPPCL password')
-    parser.add_argument('--sheet', default='UPPCL Consumption Tracker', help='Google Sheet name')
-    parser.add_argument('--service-account', default='service_account.json', help='Service account JSON')
-    parser.add_argument('--interval', type=int, default=60, help='Interval in minutes')
-    parser.add_argument('--once', action='store_true', help='Run once and exit')
+    # Get from environment variables (GitHub Actions)
+    env_username = os.getenv('UPPCL_USERNAME', '5573683932')
+    env_password = os.getenv('UPPCL_PASSWORD', '5573683932')
+    env_sheet = os.getenv('GOOGLE_SHEETS_NAME', 'UPPCL Consumption Tracker')
+    
+    sa_path = 'service_account.json'
+    
+    parser = argparse.ArgumentParser(description='UPPCL Tracker')
+    parser.add_argument('--username', default=env_username)
+    parser.add_argument('--password', default=env_password)
+    parser.add_argument('--sheet', default=env_sheet)
+    parser.add_argument('--service-account', default=sa_path)
+    parser.add_argument('--interval', type=int, default=60)
+    parser.add_argument('--once', action='store_true')
     
     args = parser.parse_args()
+    
+    logger.info("[*] UPPCL Tracker v3.7 - GitHub Actions Compatible")
     
     tracker = UPPCLGoogleSheetsTracker(
         args.username,
@@ -584,12 +349,13 @@ def main():
         args.service_account
     )
     
+    # Initialize Google Sheets first
+    tracker.init_google_sheets()
+    
     if args.once:
-        logger.info("[*] Running single capture...")
         tracker.run_once()
     else:
         tracker.run_continuous(args.interval)
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
