@@ -406,14 +406,20 @@ class UPPCLEnhancedTracker:
     
     def add_row_to_today_sheet(self, timestamp, hour, current_units, hourly_consumption, 
                                last_hour_units, benchmark, last_reading, balance, source):
-        """Add row to today's sheet"""
+        """Add row to today's sheet (with IST timestamp)"""
         try:
+            # Convert UTC timestamp to IST (UTC+5:30)
+            utc_time = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+            ist_time = utc_time + timedelta(hours=5, minutes=30)
+            ist_timestamp = ist_time.strftime('%Y-%m-%d %H:%M:%S')
+            ist_hour = ist_time.hour
+            
             # Determine if above benchmark
             above_benchmark = "YES" if benchmark and hourly_consumption > benchmark else "NO"
             
             row = [
-                timestamp,
-                hour,
+                ist_timestamp,  # IST timestamp
+                ist_hour,       # IST hour (0-23)
                 current_units,
                 hourly_consumption,
                 last_hour_units,
@@ -502,8 +508,15 @@ class UPPCLEnhancedTracker:
             time.sleep(2)
             
             # Extract all metrics
-            timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            hour = datetime.now().hour
+            # Use UTC time initially for timestamp
+            utc_now = datetime.utcnow()
+            timestamp = utc_now.strftime('%Y-%m-%d %H:%M:%S')
+            
+            # Convert to IST for hour calculation
+            ist_now = utc_now + timedelta(hours=5, minutes=30)
+            hour = ist_now.hour
+            logger.info(f"[*] Capture time: {ist_now.strftime('%Y-%m-%d %H:%M:%S IST')} (Hour {hour})")
+            
             current_units = self.extract_current_day_units()
             last_hour_units = self.get_last_hour_units()
             hourly_consumption = self.calculate_hourly_consumption(current_units, last_hour_units)
