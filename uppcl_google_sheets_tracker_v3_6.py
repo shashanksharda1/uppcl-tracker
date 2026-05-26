@@ -1,6 +1,12 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker DEBUG - Detailed logging of every step
+UPPCL Tracker - PRODUCTION VERSION
+Fixed data dumping logic:
+- Today tab: entries for current IST day only
+- This Month tab: entries for current IST month
+- Last Month tab: entries for previous IST month
+- Auto-archive when day/month changes
+- Seed with all chart data for current month on first run
 """
 import json
 import os
@@ -72,28 +78,23 @@ class UPPCLTracker:
             raise
 
     def _setup_worksheets(self, spreadsheet):
-        today = datetime.now().date()
-        today_str = today.strftime('%Y-%m-%d')
-        this_month_str = today.strftime('%B %Y')
-        last_month = today - timedelta(days=today.day)
-        last_month_str = last_month.strftime('%B %Y')
-
+        """Setup 3 fixed tabs: Today, This Month, Last Month"""
         sheet_names = {
-            'today': f"Today ({today_str})",
-            'this_month': f"This Month ({this_month_str})",
-            'last_month': f"Last Month ({last_month_str})"
+            'today': 'Today',
+            'this_month': 'This Month',
+            'last_month': 'Last Month'
         }
 
         try:
-            existing_sheets = [ws.title for ws in spreadsheet.worksheets()]
+            existing_sheets = {ws.title: ws for ws in spreadsheet.worksheets()}
 
             for key, name in sheet_names.items():
                 if name not in existing_sheets:
-                    ws = spreadsheet.add_worksheet(title=name, rows=1000, cols=10)
+                    ws = spreadsheet.add_worksheet(title=name, rows=2000, cols=10)
                     self._add_headers(ws)
                     logger.info(f"[+] Created worksheet: {name}")
                 else:
-                    ws = spreadsheet.worksheet(name)
+                    ws = existing_sheets[name]
                     logger.info(f"[+] Using existing worksheet: {name}")
 
                 self.worksheets[key] = ws
@@ -104,11 +105,12 @@ class UPPCLTracker:
 
     def _add_headers(self, worksheet):
         headers = [
-            'Timestamp', 'Hour', 'Current Day Units (kWh)', 'Hourly Consumption (kWh)',
+            'Timestamp (IST)', 'Hour (IST)', 'Current Day Units (kWh)', 'Hourly Consumption (kWh)',
             'Last Hour Units (kWh)', 'Benchmark (3-day avg)', 'Above Benchmark?',
             'Last Reading Time', 'Account Balance (Rs)', 'Source'
         ]
         worksheet.append_row(headers)
+        logger.info("[+] Headers added")
 
     def setup_chrome_driver(self):
         logger.info("[*] Setting up Chrome WebDriver...")
@@ -131,7 +133,6 @@ class UPPCLTracker:
             if chrome_result.returncode == 0:
                 chrome_bin = chrome_result.stdout.strip()
                 chrome_options.binary_location = chrome_bin
-                logger.info(f"[*] Chrome: {chrome_bin}")
 
             service = Service(chromedriver_bin)
             self.driver = webdriver.Chrome(service=service, options=chrome_options)
@@ -142,171 +143,164 @@ class UPPCLTracker:
             raise
 
     def solve_captcha(self):
-        """Solve captcha with detailed logging"""
-        logger.info("[*] SOLVING CAPTCHA...")
+        """Solve captcha using data-answer"""
+        logger.info("[*] Solving captcha...")
         try:
             captcha_div = WebDriverWait(self.driver, 3).until(
                 EC.presence_of_element_located((By.ID, "captchaText"))
             )
             
-            logger.info("[DEBUG] Captcha element found, dumping HTML:")
-            logger.info(f"[DEBUG] outerHTML: {captcha_div.get_attribute('outerHTML')}")
+            logger.info("[+] Captcha element found")
             
-            # Get data-answer
             data_answer = captcha_div.get_attribute('data-answer')
-            logger.info(f"[DEBUG] data-answer attribute: '{data_answer}'")
             
             if data_answer and data_answer.strip():
                 logger.info(f"[+] Using data-answer: '{data_answer}'")
                 captcha_answer = data_answer.strip()
             else:
-                logger.warning("[*] data-answer empty, extracting text...")
                 text_via_js = self.driver.execute_script(
                     "return document.getElementById('captchaText').textContent.trim();"
                 )
-                logger.info(f"[DEBUG] Extracted textContent: '{text_via_js}'")
+                logger.info(f"[+] Using textContent: '{text_via_js}'")
                 captcha_answer = text_via_js
             
-            # Find and log the input field
-            logger.info("[*] Finding captcha input field...")
             captcha_input = self.driver.find_element(By.ID, "captchaInput")
-            logger.info(f"[DEBUG] Input field found, type: {captcha_input.get_attribute('type')}")
-            logger.info(f"[DEBUG] Input field id: {captcha_input.get_attribute('id')}")
-            logger.info(f"[DEBUG] Input field name: {captcha_input.get_attribute('name')}")
-            
-            # Clear and send
-            logger.info(f"[*] Clearing input field...")
             captcha_input.clear()
-            
-            logger.info(f"[*] Sending captcha answer: '{captcha_answer}'")
             captcha_input.send_keys(captcha_answer)
             
-            # Verify what was sent
-            input_value = captcha_input.get_attribute('value')
-            logger.info(f"[DEBUG] Input field value after send: '{input_value}'")
-            
+            logger.info(f"[+] Sent captcha: '{captcha_answer}'")
             time.sleep(2)
             
             return True
                 
         except Exception as e:
-            logger.error(f"[!] Captcha solve error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
+            logger.warning(f"[*] Captcha error: {e}")
             return True
 
     def login(self):
-        """Login with detailed logging"""
+        """Login to UPPCL portal"""
         try:
-            logger.info("\n" + "="*80)
-            logger.info("STARTING LOGIN PROCESS")
-            logger.info("="*80)
-            
-            logger.info(f"[DEBUG] Username to use: '{self.username}'")
-            logger.info(f"[DEBUG] Password to use: '{'*'*len(self.password)}'")
-            
-            logger.info("[*] Navigating to login page...")
+            logger.info("[*] Logging in...")
             self.driver.get("https://uppclmp.myxenius.com/login.html")
-            logger.info("[+] Page loaded")
-            
-            # Get page title
-            logger.info(f"[DEBUG] Page title: {self.driver.title}")
-            
-            logger.info("[*] Waiting for username field (ID: 'name')...")
+
             username_field = WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.ID, "name"))
             )
-            logger.info(f"[+] Username field found")
-            logger.info(f"[DEBUG] Username field type: {username_field.get_attribute('type')}")
-            logger.info(f"[DEBUG] Username field placeholder: {username_field.get_attribute('placeholder')}")
-            
-            logger.info(f"[*] Sending username: '{self.username}'")
             username_field.send_keys(self.username)
-            time.sleep(0.5)
-            
-            # Verify
-            entered_username = username_field.get_attribute('value')
-            logger.info(f"[DEBUG] Username field value after send: '{entered_username}'")
-            
-            logger.info("[*] Finding password field (ID: 'password')...")
+            logger.info("[*] Username entered")
+
             password_field = self.driver.find_element(By.ID, "password")
-            logger.info(f"[+] Password field found")
-            logger.info(f"[DEBUG] Password field type: {password_field.get_attribute('type')}")
-            
-            logger.info(f"[*] Sending password (length: {len(self.password)})")
             password_field.send_keys(self.password)
-            time.sleep(0.5)
-            
-            # Verify
-            entered_password = password_field.get_attribute('value')
-            logger.info(f"[DEBUG] Password field value length: {len(entered_password)}")
-            
-            logger.info("[*] Calling solve_captcha()...")
+            logger.info("[*] Password entered")
+
             self.solve_captcha()
-            logger.info("[+] Captcha solve complete")
             
             time.sleep(1)
             
-            logger.info("[*] Checking for pre-submit alerts...")
             try:
                 alert = WebDriverWait(self.driver, 1).until(EC.alert_is_present())
-                logger.warning(f"[*] Alert found: {alert.text}")
                 alert.dismiss()
-                logger.info("[*] Alert dismissed")
                 time.sleep(1)
             except:
-                logger.info("[*] No pre-submit alert")
+                pass
 
-            logger.info("[*] Finding submit button (ID: 'submitBtn')...")
             submit_button = self.driver.find_element(By.ID, "submitBtn")
-            logger.info(f"[+] Submit button found")
-            logger.info(f"[DEBUG] Button text: {submit_button.text}")
-            logger.info(f"[DEBUG] Button type: {submit_button.get_attribute('type')}")
-            logger.info(f"[DEBUG] Button value: {submit_button.get_attribute('value')}")
-            logger.info(f"[DEBUG] Button onclick: {submit_button.get_attribute('onclick')}")
-            
-            logger.info("[*] CLICKING SUBMIT BUTTON...")
             submit_button.click()
-            logger.info("[+] Submit button clicked")
+            logger.info("[*] Submit clicked")
             
             time.sleep(2)
             
-            logger.info("[*] Checking for post-submit alerts...")
             try:
                 alert = WebDriverWait(self.driver, 1).until(EC.alert_is_present())
-                alert_text = alert.text
-                logger.warning(f"[WARNING] Post-submit alert: '{alert_text}'")
                 alert.dismiss()
-                logger.info("[*] Alert dismissed")
                 time.sleep(2)
                 return False
             except:
-                logger.info("[*] No post-submit alert - proceeding...")
+                pass
 
-            logger.info("[*] Waiting for chart element (ID: 'chartContainerHourly')...")
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.ID, "chartContainerHourly"))
             )
 
-            logger.info("[+] ✓✓✓ LOGIN SUCCESSFUL!")
+            logger.info("[+] Login successful!")
             return True
 
         except Exception as e:
             logger.error(f"[!] Login error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            
-            # Try to take screenshot
-            try:
-                logger.info("[*] Taking screenshot of current page...")
-                screenshot = self.driver.get_screenshot_as_png()
-                with open('error_screenshot.png', 'wb') as f:
-                    f.write(screenshot)
-                logger.info("[+] Screenshot saved: error_screenshot.png")
-            except:
-                pass
-            
             return False
+
+    def get_all_chart_data(self):
+        """Extract ALL hourly readings from the chart for current month (for initial seeding)"""
+        logger.info("[*] Extracting all chart data for current month...")
+        try:
+            script = """
+            var chart = Highcharts.charts[0];
+            var data = [];
+            if (chart && chart.series && chart.series.length > 0) {
+                var seriesData = chart.series[0].data;
+                if (seriesData) {
+                    for (let i = 0; i < seriesData.length; i++) {
+                        if (seriesData[i] && seriesData[i].y) {
+                            data.push({
+                                day: i + 1,
+                                value: seriesData[i].y
+                            });
+                        }
+                    }
+                }
+            }
+            return data;
+            """
+            
+            all_data = self.driver.execute_script(script)
+            logger.info(f"[+] Extracted {len(all_data)} days of data from chart")
+            return all_data
+            
+        except Exception as e:
+            logger.warning(f"[!] Could not extract all chart data: {e}")
+            return []
+
+    def seed_current_month_data(self):
+        """Seed current month tab with all available readings"""
+        logger.info("[*] Seeding current month tab with chart data...")
+        try:
+            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            current_month_start = ist_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            
+            all_data = self.get_all_chart_data()
+            
+            if not all_data:
+                logger.warning("[*] No chart data to seed")
+                return
+            
+            this_month_ws = self.worksheets['this_month']
+            existing_rows = this_month_ws.get_all_values()
+            
+            # If already has data, skip seeding
+            if len(existing_rows) > 1:
+                logger.info("[*] Month tab already has data, skipping seed")
+                return
+            
+            logger.info("[*] Seeding month tab with chart data...")
+            for item in all_data:
+                day = item['day']
+                units = item['value']
+                
+                # Create timestamp for this day at 23:59 IST (end of day)
+                date_ist = current_month_start + timedelta(days=day-1)
+                timestamp = date_ist.strftime('%Y-%m-%d %H:%M:%S')
+                hour = date_ist.hour
+                
+                row = [
+                    timestamp, hour, units, 0, 0, "N/A", "N/A",
+                    "Seeded from chart", "N/A", "Chart"
+                ]
+                this_month_ws.append_row(row)
+            
+            logger.info(f"[+] Seeded {len(all_data)} rows to month tab")
+            
+        except Exception as e:
+            logger.warning(f"[!] Seeding error: {e}")
 
     def extract_source(self):
         try:
@@ -323,7 +317,9 @@ class UPPCLTracker:
 
     def extract_current_day_units(self):
         try:
-            day_of_month = datetime.now().day
+            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            day_of_month = ist_now.day
+            
             script = """
             var chart = Highcharts.charts[0];
             if (chart && chart.series && chart.series.length > 0) {
@@ -337,9 +333,11 @@ class UPPCLTracker:
             """
             units = self.driver.execute_script(script, day_of_month)
             if units:
+                logger.info(f"[+] Units: {units} kWh")
                 return float(units)
             return 0.0
-        except:
+        except Exception as e:
+            logger.error(f"[!] Units error: {e}")
             return 0.0
 
     def extract_last_reading(self):
@@ -348,7 +346,9 @@ class UPPCLTracker:
             text = soup.get_text()
             match = re.search(r'Last Reading As on (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', text)
             if match:
-                return match.group(1)
+                reading_time = match.group(1)
+                logger.info(f"[+] Last reading: {reading_time}")
+                return reading_time
             return "N/A"
         except:
             return "N/A"
@@ -359,7 +359,9 @@ class UPPCLTracker:
             text = soup.get_text()
             match = re.search(r'Updated Balance\s*:\s*Grid Bal:\s*Rs\.\s*([\d,]+\.?\d*)', text)
             if match:
-                return match.group(1)
+                balance = match.group(1)
+                logger.info(f"[+] Balance: Rs. {balance}")
+                return balance
             return "N/A"
         except:
             return "N/A"
@@ -373,22 +375,27 @@ class UPPCLTracker:
         return consumption
 
     def get_last_hour_units(self):
+        """Get units from 1 hour ago (or last entry in Today tab)"""
         try:
             today_ws = self.worksheets['today']
             all_rows = today_ws.get_all_values()
             if len(all_rows) > 1:
                 last_row = all_rows[-1]
                 last_units = float(last_row[2]) if last_row[2] else 0.0
+                logger.info(f"[*] Last hour units: {last_units}")
                 return last_units
             return 0.0
         except:
             return 0.0
 
     def calculate_benchmark(self, hour_of_day):
+        """Calculate 3-day avg for this hour from This Month tab"""
         try:
             this_month_ws = self.worksheets['this_month']
             consumptions = []
-            current_date = datetime.now().date()
+            
+            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            current_date = ist_now.date()
 
             for days_back in range(1, 4):
                 check_date = current_date - timedelta(days=days_back)
@@ -410,68 +417,119 @@ class UPPCLTracker:
 
             if consumptions:
                 benchmark = sum(consumptions) / len(consumptions)
+                logger.info(f"[+] Benchmark: {benchmark:.2f}")
                 return round(benchmark, 2)
+            
+            logger.info("[*] No benchmark data")
             return None
 
-        except:
+        except Exception as e:
+            logger.error(f"[!] Benchmark error: {e}")
             return None
 
     def add_row_to_today_sheet(self, timestamp, hour, current_units, hourly_consumption,
                                last_hour_units, benchmark, last_reading, balance, source):
+        """Add row to Today tab"""
         try:
-            utc_time = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
-            ist_time = utc_time + timedelta(hours=5, minutes=30)
-            ist_timestamp = ist_time.strftime('%Y-%m-%d %H:%M:%S')
-            ist_hour = ist_time.hour
-
-            above_benchmark = "YES" if benchmark and hourly_consumption > benchmark else "NO"
-
             row = [
-                ist_timestamp, ist_hour, current_units, hourly_consumption,
-                last_hour_units, benchmark if benchmark else "N/A", above_benchmark,
+                timestamp, hour, current_units, hourly_consumption,
+                last_hour_units, benchmark if benchmark else "N/A", 
+                "YES" if benchmark and hourly_consumption > benchmark else "NO",
                 last_reading, balance, source
             ]
 
             today_ws = self.worksheets['today']
             today_ws.append_row(row)
+            logger.info("[+] Row added to Today tab")
+
             return True
 
         except Exception as e:
             logger.error(f"[!] Append error: {e}")
             return False
 
-    def archive_old_data(self):
+    def archive_day(self):
+        """Move yesterday's data from Today to This Month"""
+        logger.info("[*] Checking if day changed...")
         try:
             today_ws = self.worksheets['today']
-            today = datetime.now().date()
+            this_month_ws = self.worksheets['this_month']
+            
+            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            today_date = ist_now.date()
+            
             all_rows = today_ws.get_all_values()
-
-            if len(all_rows) > 1:
-                rows_to_move = []
-                rows_to_keep = [all_rows[0]]
-
-                for row in all_rows[1:]:
-                    if row and len(row) > 0:
-                        try:
-                            row_date = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date()
-                            if row_date < today:
-                                rows_to_move.append(row)
-                            else:
-                                rows_to_keep.append(row)
-                        except:
+            
+            rows_to_move = []
+            rows_to_keep = [all_rows[0]]  # Keep header
+            
+            for row in all_rows[1:]:
+                if row and len(row) > 0:
+                    try:
+                        row_date = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date()
+                        if row_date < today_date:
+                            rows_to_move.append(row)
+                        else:
                             rows_to_keep.append(row)
+                    except:
+                        rows_to_keep.append(row)
+            
+            if rows_to_move:
+                logger.info(f"[*] Moving {len(rows_to_move)} old rows to This Month...")
+                for row in rows_to_move:
+                    this_month_ws.append_row(row)
+                
+                # Keep only today's data
+                today_ws.clear()
+                today_ws.append_rows(rows_to_keep)
+                logger.info("[+] Day archived")
+        
+        except Exception as e:
+            logger.warning(f"[!] Archive error: {e}")
 
-                if rows_to_move:
-                    this_month_ws = self.worksheets['this_month']
-                    for row in rows_to_move:
-                        this_month_ws.append_row(row)
-
-                    if len(rows_to_keep) > 1:
-                        today_ws.clear()
-                        today_ws.append_rows(rows_to_keep)
-
-        except:
-            pass
+    def archive_month(self):
+        """Move last month's data from This Month to Last Month"""
+        logger.info("[*] Checking if month changed...")
+        try:
+            this_month_ws = self.worksheets['this_month']
+            last_month_ws = self.worksheets['last_month']
+            
+            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            current_month = ist_now.month
+            current_year = ist_now.year
+            
+            all_rows = this_month_ws.get_all_values()
+            
+            rows_to_move = []
+            rows_to_keep = [all_rows[0]]  # Keep header
+            
+            for row in all_rows[1:]:
+                if row and len(row) > 0:
+                    try:
+                        row_date = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S')
+                        if row_date.month != current_month or row_date.year != current_year:
+                            rows_to_move.append(row)
+                        else:
+                            rows_to_keep.append(row)
+                    except:
+                        rows_to_keep.append(row)
+            
+            if rows_to_move:
+                logger.info(f"[*] Moving {len(rows_to_move)} old rows to Last Month...")
+                
+                # Clear last month and add new data
+                last_month_ws.clear()
+                last_month_ws.append_row(all_rows[0])  # Add header
+                for row in rows_to_move:
+                    last_month_ws.append_row(row)
+                
+                # Keep only current month data
+                this_month_ws.clear()
+                this_month_ws.append_rows(rows_to_keep)
+                logger.info("[+] Month archived")
+        
+        except Exception as e:
+            logger.warning(f"[!] Month archive error: {e}")
 
     def run_once(self):
         try:
@@ -479,16 +537,25 @@ class UPPCLTracker:
             self.setup_chrome_driver()
 
             if not self.login():
-                logger.error("[!] Login failed - exiting")
+                logger.error("[!] Login failed")
                 return False
+
+            # Seed on first run
+            self.seed_current_month_data()
+            
+            # Archive old data
+            self.archive_day()
+            self.archive_month()
 
             time.sleep(2)
 
             utc_now = datetime.utcnow()
-            timestamp = utc_now.strftime('%Y-%m-%d %H:%M:%S')
-
             ist_now = utc_now + timedelta(hours=5, minutes=30)
+            
+            timestamp = ist_now.strftime('%Y-%m-%d %H:%M:%S')
             hour = ist_now.hour
+            
+            logger.info(f"[*] Time: {timestamp} IST")
 
             current_units = self.extract_current_day_units()
             last_hour_units = self.get_last_hour_units()
@@ -504,7 +571,6 @@ class UPPCLTracker:
             )
 
             if success:
-                self.archive_old_data()
                 logger.info("[+] Tracker completed successfully")
 
             return success
