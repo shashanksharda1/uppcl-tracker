@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker v4.2 - FINAL WORKING VERSION
-CRITICAL FIX: Use data-answer FIRST (already solved!)
-Only extract & solve if data-answer is empty
+UPPCL Tracker DEBUG - Detailed logging of every step
 """
 import json
 import os
@@ -111,7 +109,6 @@ class UPPCLTracker:
             'Last Reading Time', 'Account Balance (Rs)', 'Source'
         ]
         worksheet.append_row(headers)
-        logger.info("[+] Headers added")
 
     def setup_chrome_driver(self):
         logger.info("[*] Setting up Chrome WebDriver...")
@@ -145,126 +142,170 @@ class UPPCLTracker:
             raise
 
     def solve_captcha(self):
-        """
-        FINAL FIX: Use data-answer FIRST (server already solved it!)
-        Only extract & solve if data-answer is empty
-        """
-        logger.info("[*] Solving captcha...")
+        """Solve captcha with detailed logging"""
+        logger.info("[*] SOLVING CAPTCHA...")
         try:
             captcha_div = WebDriverWait(self.driver, 3).until(
                 EC.presence_of_element_located((By.ID, "captchaText"))
             )
             
-            logger.info("[+] Captcha element found")
+            logger.info("[DEBUG] Captcha element found, dumping HTML:")
+            logger.info(f"[DEBUG] outerHTML: {captcha_div.get_attribute('outerHTML')}")
             
-            # FIRST: Try data-answer (server pre-solved answer)
+            # Get data-answer
             data_answer = captcha_div.get_attribute('data-answer')
+            logger.info(f"[DEBUG] data-answer attribute: '{data_answer}'")
             
             if data_answer and data_answer.strip():
-                logger.info(f"[+] ✓✓✓ USING data-answer (PRE-SOLVED): '{data_answer}'")
+                logger.info(f"[+] Using data-answer: '{data_answer}'")
                 captcha_answer = data_answer.strip()
             else:
-                # FALLBACK: Extract displayed text and try to solve it
-                logger.info("[*] data-answer empty, extracting displayed text...")
-                
+                logger.warning("[*] data-answer empty, extracting text...")
                 text_via_js = self.driver.execute_script(
                     "return document.getElementById('captchaText').textContent.trim();"
                 )
-                
-                if text_via_js and text_via_js.strip():
-                    logger.info(f"[+] Extracted text: '{text_via_js}'")
-                    
-                    # Check if it's math and solve
-                    if any(op in text_via_js for op in ['+', '-', '*', '/']):
-                        logger.info("[*] Detected math expression, solving...")
-                        expression = text_via_js.split('=')[0].strip()
-                        try:
-                            result = eval(expression)
-                            captcha_answer = str(int(result)) if isinstance(result, float) and result.is_integer() else str(result)
-                            logger.info(f"[+] Math solved: {expression} = {captcha_answer}")
-                        except Exception as e:
-                            logger.warning(f"[!] Math solve failed: {e}, using text as-is")
-                            captcha_answer = text_via_js
-                    else:
-                        captcha_answer = text_via_js
-                else:
-                    logger.warning("[*] Could not extract captcha text")
-                    return True
+                logger.info(f"[DEBUG] Extracted textContent: '{text_via_js}'")
+                captcha_answer = text_via_js
             
-            # Enter the answer
-            logger.info(f"[+] Final answer to send: '{captcha_answer}'")
-            
+            # Find and log the input field
+            logger.info("[*] Finding captcha input field...")
             captcha_input = self.driver.find_element(By.ID, "captchaInput")
+            logger.info(f"[DEBUG] Input field found, type: {captcha_input.get_attribute('type')}")
+            logger.info(f"[DEBUG] Input field id: {captcha_input.get_attribute('id')}")
+            logger.info(f"[DEBUG] Input field name: {captcha_input.get_attribute('name')}")
+            
+            # Clear and send
+            logger.info(f"[*] Clearing input field...")
             captcha_input.clear()
+            
+            logger.info(f"[*] Sending captcha answer: '{captcha_answer}'")
             captcha_input.send_keys(captcha_answer)
             
-            logger.info(f"[+] ✓✓✓ SENT CAPTCHA: '{captcha_answer}'")
+            # Verify what was sent
+            input_value = captcha_input.get_attribute('value')
+            logger.info(f"[DEBUG] Input field value after send: '{input_value}'")
             
-            # Wait for validation
             time.sleep(2)
             
             return True
                 
         except Exception as e:
-            logger.warning(f"[*] Captcha solve error: {e}")
+            logger.error(f"[!] Captcha solve error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return True
 
     def login(self):
-        """Login to UPPCL portal"""
+        """Login with detailed logging"""
         try:
-            logger.info("[*] Logging in...")
+            logger.info("\n" + "="*80)
+            logger.info("STARTING LOGIN PROCESS")
+            logger.info("="*80)
+            
+            logger.info(f"[DEBUG] Username to use: '{self.username}'")
+            logger.info(f"[DEBUG] Password to use: '{'*'*len(self.password)}'")
+            
+            logger.info("[*] Navigating to login page...")
             self.driver.get("https://uppclmp.myxenius.com/login.html")
-
+            logger.info("[+] Page loaded")
+            
+            # Get page title
+            logger.info(f"[DEBUG] Page title: {self.driver.title}")
+            
+            logger.info("[*] Waiting for username field (ID: 'name')...")
             username_field = WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.ID, "name"))
             )
+            logger.info(f"[+] Username field found")
+            logger.info(f"[DEBUG] Username field type: {username_field.get_attribute('type')}")
+            logger.info(f"[DEBUG] Username field placeholder: {username_field.get_attribute('placeholder')}")
+            
+            logger.info(f"[*] Sending username: '{self.username}'")
             username_field.send_keys(self.username)
-            logger.info("[*] Username entered")
-
+            time.sleep(0.5)
+            
+            # Verify
+            entered_username = username_field.get_attribute('value')
+            logger.info(f"[DEBUG] Username field value after send: '{entered_username}'")
+            
+            logger.info("[*] Finding password field (ID: 'password')...")
             password_field = self.driver.find_element(By.ID, "password")
+            logger.info(f"[+] Password field found")
+            logger.info(f"[DEBUG] Password field type: {password_field.get_attribute('type')}")
+            
+            logger.info(f"[*] Sending password (length: {len(self.password)})")
             password_field.send_keys(self.password)
-            logger.info("[*] Password entered")
-
+            time.sleep(0.5)
+            
+            # Verify
+            entered_password = password_field.get_attribute('value')
+            logger.info(f"[DEBUG] Password field value length: {len(entered_password)}")
+            
+            logger.info("[*] Calling solve_captcha()...")
             self.solve_captcha()
-            logger.info("[*] Captcha solve complete")
+            logger.info("[+] Captcha solve complete")
             
             time.sleep(1)
             
+            logger.info("[*] Checking for pre-submit alerts...")
             try:
                 alert = WebDriverWait(self.driver, 1).until(EC.alert_is_present())
-                logger.info("[*] Pre-submit alert detected, dismissing...")
+                logger.warning(f"[*] Alert found: {alert.text}")
                 alert.dismiss()
                 logger.info("[*] Alert dismissed")
                 time.sleep(1)
             except:
-                logger.info("[*] No pre-submit alert found")
+                logger.info("[*] No pre-submit alert")
 
-            logger.info("[*] Clicking submit button...")
+            logger.info("[*] Finding submit button (ID: 'submitBtn')...")
             submit_button = self.driver.find_element(By.ID, "submitBtn")
+            logger.info(f"[+] Submit button found")
+            logger.info(f"[DEBUG] Button text: {submit_button.text}")
+            logger.info(f"[DEBUG] Button type: {submit_button.get_attribute('type')}")
+            logger.info(f"[DEBUG] Button value: {submit_button.get_attribute('value')}")
+            logger.info(f"[DEBUG] Button onclick: {submit_button.get_attribute('onclick')}")
+            
+            logger.info("[*] CLICKING SUBMIT BUTTON...")
             submit_button.click()
-            logger.info("[*] Submit button clicked")
+            logger.info("[+] Submit button clicked")
             
             time.sleep(2)
             
+            logger.info("[*] Checking for post-submit alerts...")
             try:
                 alert = WebDriverWait(self.driver, 1).until(EC.alert_is_present())
-                logger.warning(f"[*] Post-submit alert: {alert.text}")
+                alert_text = alert.text
+                logger.warning(f"[WARNING] Post-submit alert: '{alert_text}'")
                 alert.dismiss()
                 logger.info("[*] Alert dismissed")
                 time.sleep(2)
+                return False
             except:
-                logger.info("[*] No post-submit alert found - proceeding...")
+                logger.info("[*] No post-submit alert - proceeding...")
 
-            logger.info("[*] Waiting for chart to load...")
+            logger.info("[*] Waiting for chart element (ID: 'chartContainerHourly')...")
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.ID, "chartContainerHourly"))
             )
 
-            logger.info("[+] Login successful!")
+            logger.info("[+] ✓✓✓ LOGIN SUCCESSFUL!")
             return True
 
         except Exception as e:
             logger.error(f"[!] Login error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            
+            # Try to take screenshot
+            try:
+                logger.info("[*] Taking screenshot of current page...")
+                screenshot = self.driver.get_screenshot_as_png()
+                with open('error_screenshot.png', 'wb') as f:
+                    f.write(screenshot)
+                logger.info("[+] Screenshot saved: error_screenshot.png")
+            except:
+                pass
+            
             return False
 
     def extract_source(self):
@@ -275,12 +316,9 @@ class UPPCLTracker:
                 text = h1.get_text()
                 match = re.search(r'Source\s*:\s*(\w+)', text, re.IGNORECASE)
                 if match:
-                    source = match.group(1)
-                    logger.info(f"[+] Source: {source}")
-                    return source
+                    return match.group(1)
             return "Unknown"
-        except Exception as e:
-            logger.error(f"[!] Source error: {e}")
+        except:
             return "Unknown"
 
     def extract_current_day_units(self):
@@ -299,11 +337,9 @@ class UPPCLTracker:
             """
             units = self.driver.execute_script(script, day_of_month)
             if units:
-                logger.info(f"[+] Units: {units} kWh")
                 return float(units)
             return 0.0
-        except Exception as e:
-            logger.error(f"[!] Units error: {e}")
+        except:
             return 0.0
 
     def extract_last_reading(self):
@@ -312,12 +348,9 @@ class UPPCLTracker:
             text = soup.get_text()
             match = re.search(r'Last Reading As on (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', text)
             if match:
-                reading_time = match.group(1)
-                logger.info(f"[+] Last reading: {reading_time}")
-                return reading_time
+                return match.group(1)
             return "N/A"
-        except Exception as e:
-            logger.error(f"[!] Reading error: {e}")
+        except:
             return "N/A"
 
     def extract_balance(self):
@@ -326,12 +359,9 @@ class UPPCLTracker:
             text = soup.get_text()
             match = re.search(r'Updated Balance\s*:\s*Grid Bal:\s*Rs\.\s*([\d,]+\.?\d*)', text)
             if match:
-                balance = match.group(1)
-                logger.info(f"[+] Balance: Rs. {balance}")
-                return balance
+                return match.group(1)
             return "N/A"
-        except Exception as e:
-            logger.error(f"[!] Balance error: {e}")
+        except:
             return "N/A"
 
     def calculate_hourly_consumption(self, current_units, last_hour_units):
@@ -340,7 +370,6 @@ class UPPCLTracker:
         consumption = current_units - last_hour_units
         if consumption < 0:
             return 0.0
-        logger.info(f"[+] Consumption: {consumption} kWh")
         return consumption
 
     def get_last_hour_units(self):
@@ -350,12 +379,9 @@ class UPPCLTracker:
             if len(all_rows) > 1:
                 last_row = all_rows[-1]
                 last_units = float(last_row[2]) if last_row[2] else 0.0
-                logger.info(f"[*] Last hour: {last_units} kWh")
                 return last_units
-            logger.info("[*] No previous data")
             return 0.0
-        except Exception as e:
-            logger.error(f"[!] Last hour error: {e}")
+        except:
             return 0.0
 
     def calculate_benchmark(self, hour_of_day):
@@ -384,14 +410,10 @@ class UPPCLTracker:
 
             if consumptions:
                 benchmark = sum(consumptions) / len(consumptions)
-                logger.info(f"[+] Benchmark: {benchmark:.2f} kWh")
                 return round(benchmark, 2)
-            else:
-                logger.info(f"[*] No benchmark data")
-                return None
+            return None
 
-        except Exception as e:
-            logger.error(f"[!] Benchmark error: {e}")
+        except:
             return None
 
     def add_row_to_today_sheet(self, timestamp, hour, current_units, hourly_consumption,
@@ -412,8 +434,6 @@ class UPPCLTracker:
 
             today_ws = self.worksheets['today']
             today_ws.append_row(row)
-            logger.info("[+] Row added to Google Sheets")
-
             return True
 
         except Exception as e:
@@ -445,14 +465,13 @@ class UPPCLTracker:
                     this_month_ws = self.worksheets['this_month']
                     for row in rows_to_move:
                         this_month_ws.append_row(row)
-                    logger.info(f"[+] Archived {len(rows_to_move)} rows")
 
                     if len(rows_to_keep) > 1:
                         today_ws.clear()
                         today_ws.append_rows(rows_to_keep)
 
-        except Exception as e:
-            logger.error(f"[!] Archive error: {e}")
+        except:
+            pass
 
     def run_once(self):
         try:
@@ -460,7 +479,7 @@ class UPPCLTracker:
             self.setup_chrome_driver()
 
             if not self.login():
-                logger.error("[!] Login failed")
+                logger.error("[!] Login failed - exiting")
                 return False
 
             time.sleep(2)
@@ -470,7 +489,6 @@ class UPPCLTracker:
 
             ist_now = utc_now + timedelta(hours=5, minutes=30)
             hour = ist_now.hour
-            logger.info(f"[*] Time: {ist_now.strftime('%Y-%m-%d %H:%M:%S IST')}")
 
             current_units = self.extract_current_day_units()
             last_hour_units = self.get_last_hour_units()
