@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker - CHART DEBUG
-Capture page state and element details when extraction fails
+UPPCL Tracker - SMART EXTRACTION
+Intelligently handles both hourly and daily chart modes
 """
 import json
 import os
@@ -203,7 +203,6 @@ class UPPCLTracker:
             except:
                 pass
 
-            logger.info("[*] Waiting for chart container...")
             WebDriverWait(self.driver, 15).until(
                 EC.presence_of_element_located((By.ID, "chartContainerHourly"))
             )
@@ -215,128 +214,157 @@ class UPPCLTracker:
             logger.error(f"[!] Login error: {e}")
             return False
 
-    def debug_chart_state(self):
-        """Debug what's in the page and chart"""
-        logger.info("[DEBUG] ========== PAGE STATE DEBUG ==========")
-        
+    def detect_chart_type(self):
+        """Detect if chart is showing hourly or daily data"""
         try:
-            # Check page title
-            title = self.driver.title
-            logger.info(f"[DEBUG] Page title: {title}")
-            
-            # Check for chart container
-            try:
-                chart_container = self.driver.find_element(By.ID, "chartContainerHourly")
-                logger.info(f"[DEBUG] Chart container found: {chart_container.is_displayed()}")
-            except:
-                logger.warning("[DEBUG] Chart container NOT found")
-            
-            # Check for Highcharts
-            charts_count = self.driver.execute_script("return Highcharts.charts.length;")
-            logger.info(f"[DEBUG] Highcharts instances: {charts_count}")
-            
-            # Check series data
-            try:
-                series_data = self.driver.execute_script("""
-                    if (Highcharts.charts.length > 0) {
-                        var chart = Highcharts.charts[0];
-                        if (chart && chart.series && chart.series.length > 0) {
-                            return {
-                                seriesCount: chart.series.length,
-                                firstSeriesLength: chart.series[0].data.length,
-                                firstSeriesName: chart.series[0].name,
-                                firstValue: chart.series[0].data[0] ? chart.series[0].data[0].y : null
-                            };
-                        }
-                    }
-                    return null;
-                """)
-                if series_data:
-                    logger.info(f"[DEBUG] Series data: {series_data}")
-                else:
-                    logger.warning("[DEBUG] No series data found in chart")
-            except Exception as e:
-                logger.warning(f"[DEBUG] Could not check series: {e}")
-            
-            # Check page HTML for "Current Month Consumption"
-            page_source = self.driver.page_source
-            if "Current Month Consumption" in page_source:
-                logger.info("[DEBUG] ✓ 'Current Month Consumption' text found on page")
-            else:
-                logger.warning("[DEBUG] ✗ 'Current Month Consumption' text NOT found")
-            
-            # Check for month label
-            if "May-2026" in page_source or "2026" in page_source:
-                logger.info("[DEBUG] ✓ Month/year label found on page")
-            else:
-                logger.warning("[DEBUG] ✗ Month/year label NOT found")
-            
-            # List all divs with "chart" in id
-            chart_elements = self.driver.find_elements(By.XPATH, "//*[contains(@id, 'chart')]")
-            logger.info(f"[DEBUG] Found {len(chart_elements)} elements with 'chart' in id:")
-            for elem in chart_elements[:5]:  # First 5
-                logger.info(f"[DEBUG]   - ID: {elem.get_attribute('id')}")
-            
-        except Exception as e:
-            logger.error(f"[DEBUG] Error during debug: {e}")
-        
-        logger.info("[DEBUG] ======================================")
-
-    def take_screenshot(self, name="debug"):
-        """Take a screenshot for inspection"""
-        try:
-            timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-            filename = f"/tmp/{name}_{timestamp}.png"
-            self.driver.save_screenshot(filename)
-            logger.info(f"[DEBUG] Screenshot saved: {filename}")
-            return filename
-        except Exception as e:
-            logger.warning(f"[!] Screenshot error: {e}")
-            return None
-
-    def extract_current_day_units(self):
-        """Extract with detailed debugging"""
-        try:
-            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-            day_of_month = ist_now.day
-            
-            logger.info(f"[*] Extracting units for day {day_of_month}...")
-            
-            # First debug the chart state
-            self.debug_chart_state()
-            
-            # Try extraction
             script = """
-            var chart = Highcharts.charts[0];
-            if (chart && chart.series && chart.series.length > 0) {
-                var seriesData = chart.series[0].data;
-                var dayIndex = arguments[0] - 1;
-                if (seriesData && seriesData[dayIndex]) {
-                    return seriesData[dayIndex].y;
+            if (Highcharts.charts.length > 0) {
+                var chart = Highcharts.charts[0];
+                if (chart && chart.series && chart.series.length > 0) {
+                    var seriesData = chart.series[0].data;
+                    var dataPoints = seriesData.length;
+                    // Hourly chart has ~24-25 points, daily has ~28-31
+                    if (dataPoints <= 25) {
+                        return 'HOURLY';
+                    } else {
+                        return 'DAILY';
+                    }
                 }
             }
-            return null;
+            return 'UNKNOWN';
             """
-            units = self.driver.execute_script(script, day_of_month)
+            chart_type = self.driver.execute_script(script)
+            logger.info(f"[DEBUG] Chart type detected: {chart_type}")
+            return chart_type
+        except Exception as e:
+            logger.warning(f"[!] Could not detect chart type: {e}")
+            return 'UNKNOWN'
+
+    def extract_current_day_units_smart(self):
+        """Smart extraction: handles both hourly and daily charts"""
+        try:
+            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            hour = ist_now.hour
+            day_of_month = ist_now.day
             
-            if units:
-                logger.info(f"[+] Units: {units} kWh")
-                return float(units)
-            else:
-                logger.warning(f"[!] Could not extract units for day {day_of_month}")
-                logger.warning("[!] Possible reasons:")
-                logger.warning("    - Chart not fully loaded")
-                logger.warning("    - Day index out of range")
-                logger.warning("    - Data structure different than expected")
-                
-                # Take screenshot for manual inspection
-                self.take_screenshot("extraction_failed")
-                return 0.0
+            logger.info(f"[*] Smart extraction for {ist_now.strftime('%Y-%m-%d %H:%M')} IST")
+            
+            # Detect chart type
+            chart_type = self.detect_chart_type()
+            
+            if chart_type == 'HOURLY':
+                logger.info("[*] Chart is HOURLY - extracting current hour...")
+                script = """
+                var chart = Highcharts.charts[0];
+                if (chart && chart.series && chart.series.length > 0) {
+                    var seriesData = chart.series[0].data;
+                    // For hourly chart, hour index is the hour of day
+                    var hourIndex = arguments[0];
+                    if (seriesData && seriesData[hourIndex]) {
+                        return seriesData[hourIndex].y;
+                    }
+                }
+                return null;
+                """
+                units = self.driver.execute_script(script, hour)
+                if units is not None:
+                    logger.info(f"[+] Extracted hourly units at {hour}:00 = {units} kWh")
+                    return float(units)
+            
+            elif chart_type == 'DAILY':
+                logger.info("[*] Chart is DAILY - extracting current day's total...")
+                script = """
+                var chart = Highcharts.charts[0];
+                if (chart && chart.series && chart.series.length > 0) {
+                    var seriesData = chart.series[0].data;
+                    // For daily chart, day index is day-1
+                    var dayIndex = arguments[0] - 1;
+                    if (seriesData && seriesData[dayIndex]) {
+                        return seriesData[dayIndex].y;
+                    }
+                }
+                return null;
+                """
+                units = self.driver.execute_script(script, day_of_month)
+                if units is not None:
+                    logger.info(f"[+] Extracted daily units for day {day_of_month} = {units} kWh")
+                    return float(units)
+            
+            logger.warning("[!] Could not extract units - chart type unknown")
+            return 0.0
                 
         except Exception as e:
-            logger.error(f"[!] Units error: {e}")
-            self.take_screenshot("extraction_error")
+            logger.error(f"[!] Extraction error: {e}")
             return 0.0
+
+    def get_all_chart_data(self):
+        logger.info("[*] Extracting all chart data...")
+        try:
+            script = """
+            var chart = Highcharts.charts[0];
+            var data = [];
+            if (chart && chart.series && chart.series.length > 0) {
+                var seriesData = chart.series[0].data;
+                if (seriesData) {
+                    for (let i = 0; i < seriesData.length; i++) {
+                        if (seriesData[i] && seriesData[i].y) {
+                            data.push({
+                                index: i,
+                                value: seriesData[i].y
+                            });
+                        }
+                    }
+                }
+            }
+            return data;
+            """
+            
+            all_data = self.driver.execute_script(script)
+            logger.info(f"[+] Extracted {len(all_data)} data points from chart")
+            return all_data
+            
+        except Exception as e:
+            logger.warning(f"[!] Could not extract all chart data: {e}")
+            return []
+
+    def seed_current_month_data(self):
+        logger.info("[*] Seeding current month tab...")
+        try:
+            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            current_month_start = ist_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            
+            all_data = self.get_all_chart_data()
+            
+            if not all_data:
+                logger.warning("[*] No chart data to seed")
+                return
+            
+            this_month_ws = self.worksheets['this_month']
+            existing_rows = this_month_ws.get_all_values()
+            
+            if len(existing_rows) > 1:
+                logger.info("[*] Month tab already has data, skipping seed")
+                return
+            
+            logger.info(f"[*] Seeding {len(all_data)} rows...")
+            for item in all_data:
+                day = item['index'] + 1
+                units = item['value']
+                
+                date_ist = current_month_start + timedelta(days=day-1)
+                timestamp = date_ist.strftime('%Y-%m-%d %H:%M:%S')
+                hour = date_ist.hour
+                
+                row = [
+                    timestamp, hour, units, 0, 0, "N/A", "N/A",
+                    "Seeded from chart", "N/A", "Chart"
+                ]
+                this_month_ws.append_row(row)
+            
+            logger.info(f"[+] Seeded {len(all_data)} rows")
+            
+        except Exception as e:
+            logger.warning(f"[!] Seeding error: {e}")
 
     def extract_source(self):
         try:
@@ -494,13 +522,15 @@ class UPPCLTracker:
                 logger.error("[!] Login failed")
                 return False
 
-            time.sleep(3)  # Extra time for page to settle
+            self.seed_current_month_data()
             
+            time.sleep(2)
+
             ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
             timestamp = ist_now.strftime('%Y-%m-%d %H:%M:%S')
             hour = ist_now.hour
 
-            current_units = self.extract_current_day_units()
+            current_units = self.extract_current_day_units_smart()
             last_hour_units = self.get_last_hour_units()
             hourly_consumption = self.calculate_hourly_consumption(current_units, last_hour_units)
             benchmark = self.calculate_benchmark(hour)
