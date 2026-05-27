@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker - LOGIN FAILURE DEBUG
-Capture exact reason why login fails at midnight
+UPPCL Tracker - TIMEZONE DEBUG
+Detailed IST vs UTC analysis
 """
 import json
 import os
@@ -10,6 +10,7 @@ import time
 import re
 import subprocess
 from datetime import datetime, timedelta
+import pytz
 
 from flask import Flask, jsonify
 import gspread
@@ -83,6 +84,47 @@ class UPPCLTracker:
                    'Last Reading Time', 'Account Balance (Rs)', 'Source']
         worksheet.append_row(headers)
 
+    def debug_timezones(self):
+        """CRITICAL: Debug all timezone calculations"""
+        logger.info("\n" + "="*80)
+        logger.info("TIMEZONE DEBUG - CRITICAL ANALYSIS")
+        logger.info("="*80)
+        
+        # Get all timezone representations
+        utc_now = datetime.utcnow()
+        ist_manual = utc_now + timedelta(hours=5, minutes=30)
+        
+        # Using pytz
+        utc_tz = pytz.UTC
+        ist_tz = pytz.timezone('Asia/Kolkata')
+        
+        utc_aware = utc_tz.localize(utc_now)
+        ist_aware = utc_aware.astimezone(ist_tz)
+        
+        logger.info("[DEBUG] METHOD 1: datetime.utcnow() + timedelta(hours=5, minutes=30)")
+        logger.info(f"        UTC:  {utc_now.strftime('%Y-%m-%d %H:%M:%S')}")
+        logger.info(f"        IST:  {ist_manual.strftime('%Y-%m-%d %H:%M:%S')}")
+        
+        logger.info("[DEBUG] METHOD 2: pytz.timezone('Asia/Kolkata')")
+        logger.info(f"        UTC:  {utc_aware.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        logger.info(f"        IST:  {ist_aware.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+        
+        logger.info("[DEBUG] COMPARISON:")
+        logger.info(f"        Method 1 hour: {ist_manual.hour} | Method 2 hour: {ist_aware.hour}")
+        
+        if ist_manual.hour != ist_aware.hour:
+            logger.error(f"[!] ⚠️  TIMEZONE MISMATCH! {ist_manual.hour} vs {ist_aware.hour}")
+        else:
+            logger.info(f"[+] ✓ Timezones match: Both show {ist_manual.hour}")
+        
+        logger.info("[DEBUG] MIDNIGHT CHECK:")
+        logger.info(f"        ist_manual.hour < 6? {ist_manual.hour < 6}")
+        logger.info(f"        ist_aware.hour < 6? {ist_aware.hour < 6}")
+        
+        logger.info("="*80 + "\n")
+        
+        return ist_manual, ist_aware
+
     def setup_chrome_driver(self):
         logger.info("[*] Setting up Chrome WebDriver...")
         try:
@@ -106,23 +148,6 @@ class UPPCLTracker:
         except Exception as e:
             logger.error(f"[!] WebDriver error: {e}")
             raise
-
-    def check_page_source(self, label):
-        """Debug: check page source for issues"""
-        try:
-            source = self.driver.page_source
-            logger.info(f"[DEBUG] {label} - Page source length: {len(source)}")
-            
-            # Check for error messages
-            if "error" in source.lower():
-                logger.warning(f"[DEBUG] {label} - Found 'error' in page")
-            if "invalid" in source.lower():
-                logger.warning(f"[DEBUG] {label} - Found 'invalid' in page")
-            if "failed" in source.lower():
-                logger.warning(f"[DEBUG] {label} - Found 'failed' in page")
-                
-        except Exception as e:
-            logger.warning(f"[DEBUG] Could not check page source: {e}")
 
     def solve_captcha(self):
         logger.info("[*] Solving captcha...")
@@ -150,101 +175,64 @@ class UPPCLTracker:
             logger.info(f"[+] Sent captcha: '{captcha_answer}'")
             time.sleep(2)
             return True
-                
         except Exception as e:
             logger.warning(f"[*] Captcha error: {e}")
             return True
 
     def login(self):
         try:
-            logger.info("\n" + "="*80)
-            logger.info("LOGIN ATTEMPT")
-            logger.info("="*80)
-            
-            logger.info("[*] Navigating to login page...")
+            logger.info("[*] Logging in...")
             self.driver.get("https://uppclmp.myxenius.com/login.html")
-            logger.info(f"[DEBUG] Page loaded, title: {self.driver.title}")
-            self.check_page_source("AFTER_PAGE_LOAD")
-            
-            logger.info("[*] Waiting for username field...")
+
             username_field = WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.ID, "name"))
             )
             username_field.send_keys(self.username)
-            logger.info(f"[DEBUG] Username sent")
 
             password_field = self.driver.find_element(By.ID, "password")
             password_field.send_keys(self.password)
-            logger.info(f"[DEBUG] Password sent")
 
             self.solve_captcha()
             time.sleep(1)
             
-            # Check for pre-submit alerts
             try:
                 alert = WebDriverWait(self.driver, 1).until(EC.alert_is_present())
-                logger.warning(f"[!] Pre-submit alert: {alert.text}")
                 alert.dismiss()
                 time.sleep(1)
             except:
-                logger.info("[*] No pre-submit alert")
+                pass
 
-            logger.info("[*] Clicking submit...")
             submit_button = self.driver.find_element(By.ID, "submitBtn")
             submit_button.click()
-            logger.info("[DEBUG] Submit button clicked")
             
             time.sleep(2)
             
-            # Check page after submit
-            self.check_page_source("AFTER_SUBMIT")
-            logger.info(f"[DEBUG] Current URL after submit: {self.driver.current_url}")
-            
-            # Check for post-submit alerts
             try:
-                alert = WebDriverWait(self.driver, 2).until(EC.alert_is_present())
-                alert_text = alert.text
-                logger.error(f"[!] ❌ POST-SUBMIT ALERT: '{alert_text}'")
+                alert = WebDriverWait(self.driver, 1).until(EC.alert_is_present())
                 alert.dismiss()
                 time.sleep(2)
                 return False
             except:
-                logger.info("[*] No post-submit alert")
+                pass
 
-            # Wait for chart with extended timeout
-            logger.info("[*] Waiting for chart (15 sec timeout)...")
-            try:
-                WebDriverWait(self.driver, 15).until(
-                    EC.presence_of_element_located((By.ID, "chartContainerHourly"))
-                )
-                logger.info("[+] ✓✓✓ LOGIN SUCCESSFUL!")
-                return True
-            except Exception as e:
-                logger.error(f"[!] Chart not found after 15 sec: {e}")
-                logger.error(f"[DEBUG] Current URL: {self.driver.current_url}")
-                self.check_page_source("CHART_NOT_FOUND")
-                
-                # Try to find any content
-                try:
-                    page_title = self.driver.find_element(By.TAG_NAME, "h1").text
-                    logger.error(f"[DEBUG] Page heading: {page_title}")
-                except:
-                    pass
-                
-                return False
+            WebDriverWait(self.driver, 15).until(
+                EC.presence_of_element_located((By.ID, "chartContainerHourly"))
+            )
+
+            logger.info("[+] Login successful!")
+            return True
 
         except Exception as e:
             logger.error(f"[!] Login error: {e}")
-            import traceback
-            logger.error(traceback.format_exc())
-            self.check_page_source("LOGIN_EXCEPTION")
             return False
 
     def extract_current_day_units(self):
-        """Simple extraction"""
         try:
+            # CRITICAL: Use the SAME timezone method as the skip check!
             ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
             day_of_month = ist_now.day
+            
+            logger.info(f"[DEBUG] Extracting for day {day_of_month} (IST hour: {ist_now.hour})")
             
             script = """
             var chart = Highcharts.charts[0];
@@ -269,22 +257,16 @@ class UPPCLTracker:
     def extract_last_reading(self):
         try:
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-            text = soup.get_text()
-            match = re.search(r'Last Reading As on (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', text)
-            if match:
-                return match.group(1)
-            return "N/A"
+            match = re.search(r'Last Reading As on (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', soup.get_text())
+            return match.group(1) if match else "N/A"
         except:
             return "N/A"
 
     def extract_balance(self):
         try:
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-            text = soup.get_text()
-            match = re.search(r'Updated Balance\s*:\s*Grid Bal:\s*Rs\.\s*([\d,]+\.?\d*)', text)
-            if match:
-                return match.group(1)
-            return "N/A"
+            match = re.search(r'Grid Bal:\s*Rs\.\s*([\d,]+\.?\d*)', soup.get_text())
+            return match.group(1) if match else "N/A"
         except:
             return "N/A"
 
@@ -293,53 +275,148 @@ class UPPCLTracker:
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             h1 = soup.find('h1', class_='clearfix')
             if h1:
-                text = h1.get_text()
-                match = re.search(r'Source\s*:\s*(\w+)', text, re.IGNORECASE)
+                match = re.search(r'Source\s*:\s*(\w+)', h1.get_text(), re.IGNORECASE)
                 if match:
                     return match.group(1)
             return "Unknown"
         except:
             return "Unknown"
 
+    def calculate_hourly_consumption(self, current_units, last_hour_units):
+        if last_hour_units is None or last_hour_units == 0:
+            return 0.0
+        return max(0.0, current_units - last_hour_units)
+
+    def get_last_hour_units(self):
+        try:
+            all_rows = self.worksheets['today'].get_all_values()
+            if len(all_rows) > 1:
+                return float(all_rows[-1][2]) if all_rows[-1][2] else 0.0
+            return 0.0
+        except:
+            return 0.0
+
+    def calculate_benchmark(self, hour_of_day):
+        try:
+            this_month_ws = self.worksheets['this_month']
+            consumptions = []
+            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            current_date = ist_now.date()
+
+            for days_back in range(1, 4):
+                check_date = current_date - timedelta(days=days_back)
+                for row in this_month_ws.get_all_values()[1:]:
+                    if row and len(row) > 3:
+                        try:
+                            row_date = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date()
+                            row_hour = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').hour
+                            if row_date == check_date and row_hour == hour_of_day:
+                                consumption = float(row[3]) if row[3] else 0.0
+                                if consumption > 0:
+                                    consumptions.append(consumption)
+                        except:
+                            pass
+
+            return round(sum(consumptions) / len(consumptions), 2) if consumptions else None
+        except Exception as e:
+            logger.error(f"[!] Benchmark error: {e}")
+            return None
+
+    def add_row_to_today_sheet(self, timestamp, hour, current_units, hourly_consumption, last_hour_units, benchmark, last_reading, balance, source):
+        try:
+            row = [timestamp, hour, current_units, hourly_consumption, last_hour_units,
+                   benchmark if benchmark else "N/A", "YES" if benchmark and hourly_consumption > benchmark else "NO",
+                   last_reading, balance, source]
+            self.worksheets['today'].append_row(row)
+            logger.info("[+] Row added to Today tab")
+            return True
+        except Exception as e:
+            logger.error(f"[!] Append error: {e}")
+            return False
+
+    def archive_old_data(self):
+        try:
+            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            today_date = ist_now.date()
+            
+            today_ws = self.worksheets['today']
+            this_month_ws = self.worksheets['this_month']
+            all_rows = today_ws.get_all_values()
+            
+            rows_to_move = []
+            rows_to_keep = [all_rows[0]]
+            
+            for row in all_rows[1:]:
+                if row and len(row) > 0:
+                    try:
+                        if datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date() < today_date:
+                            rows_to_move.append(row)
+                        else:
+                            rows_to_keep.append(row)
+                    except:
+                        rows_to_keep.append(row)
+            
+            if rows_to_move:
+                for row in rows_to_move:
+                    this_month_ws.append_row(row)
+                today_ws.clear()
+                today_ws.append_rows(rows_to_keep)
+        except Exception as e:
+            logger.error(f"[!] Archive error: {e}")
+
     def run_once(self):
         try:
-            logger.info("\n\n")
-            logger.info("╔" + "="*78 + "╗")
-            logger.info("║" + " "*25 + "UPPCL TRACKER RUN" + " "*37 + "║")
-            logger.info("╚" + "="*78 + "╝")
+            logger.info("\n" + "="*80)
+            logger.info("UPPCL TRACKER RUN - TIMEZONE DEBUG")
+            logger.info("="*80)
             
-            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-            logger.info(f"[*] IST Time: {ist_now.strftime('%Y-%m-%d %H:%M:%S')}")
+            # DEBUG TIMEZONES FIRST!
+            ist_manual, ist_aware = self.debug_timezones()
             
             self.setup_chrome_driver()
 
             if not self.login():
-                logger.error("[!] ❌ LOGIN FAILED - STOPPING HERE FOR DEBUGGING")
+                logger.error("[!] Login failed")
                 return False
 
             time.sleep(2)
-            
-            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+
+            # Use the same ist_now as in debug
+            ist_now = ist_manual
             timestamp = ist_now.strftime('%Y-%m-%d %H:%M:%S')
             hour = ist_now.hour
 
-            logger.info(f"[*] Extracting data...")
+            logger.info(f"[*] IST Time: {timestamp}, Hour: {hour}")
+
             current_units = self.extract_current_day_units()
+            last_hour_units = self.get_last_hour_units()
+            hourly_consumption = self.calculate_hourly_consumption(current_units, last_hour_units)
+            benchmark = self.calculate_benchmark(hour)
             last_reading = self.extract_last_reading()
             balance = self.extract_balance()
             source = self.extract_source()
 
-            logger.info(f"\n[+] Extracted: {current_units} kWh, {last_reading}, {balance}")
-            return True
+            success = self.add_row_to_today_sheet(
+                timestamp, hour, current_units, hourly_consumption,
+                last_hour_units, benchmark, last_reading, balance, source
+            )
+
+            if success:
+                self.archive_old_data()
+                logger.info("[+] Tracker completed successfully")
+
+            return success
 
         except Exception as e:
-            logger.error(f"[!] Error: {e}")
+            logger.error(f"[!] Tracker error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
 
         finally:
             if self.driver:
                 self.driver.quit()
-            logger.info("="*80)
+            logger.info("="*80 + "\n")
 
 
 @app.route('/', methods=['GET', 'POST'])
