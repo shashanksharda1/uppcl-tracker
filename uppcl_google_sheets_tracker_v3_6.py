@@ -1,12 +1,7 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker - PRODUCTION VERSION
-Fixed data dumping logic:
-- Today tab: entries for current IST day only
-- This Month tab: entries for current IST month
-- Last Month tab: entries for previous IST month
-- Auto-archive when day/month changes
-- Seed with all chart data for current month on first run
+UPPCL Tracker - MIDNIGHT FIX
+Handle 12am-6am timezone issues and day/month transitions
 """
 import json
 import os
@@ -110,7 +105,6 @@ class UPPCLTracker:
             'Last Reading Time', 'Account Balance (Rs)', 'Source'
         ]
         worksheet.append_row(headers)
-        logger.info("[+] Headers added")
 
     def setup_chrome_driver(self):
         logger.info("[*] Setting up Chrome WebDriver...")
@@ -127,7 +121,6 @@ class UPPCLTracker:
                 raise Exception("ChromeDriver not found")
 
             chromedriver_bin = result.stdout.strip()
-            logger.info(f"[*] ChromeDriver: {chromedriver_bin}")
 
             chrome_result = subprocess.run(['which', 'google-chrome'], capture_output=True, text=True)
             if chrome_result.returncode == 0:
@@ -231,7 +224,7 @@ class UPPCLTracker:
 
     def get_all_chart_data(self):
         """Extract ALL hourly readings from the chart for current month (for initial seeding)"""
-        logger.info("[*] Extracting all chart data for current month...")
+        logger.info("[*] Extracting all chart data...")
         try:
             script = """
             var chart = Highcharts.charts[0];
@@ -262,7 +255,7 @@ class UPPCLTracker:
 
     def seed_current_month_data(self):
         """Seed current month tab with all available readings"""
-        logger.info("[*] Seeding current month tab with chart data...")
+        logger.info("[*] Seeding current month tab...")
         try:
             ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
             current_month_start = ist_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
@@ -276,17 +269,16 @@ class UPPCLTracker:
             this_month_ws = self.worksheets['this_month']
             existing_rows = this_month_ws.get_all_values()
             
-            # If already has data, skip seeding
+            # If already has data (>1 means header + data), skip seeding
             if len(existing_rows) > 1:
                 logger.info("[*] Month tab already has data, skipping seed")
                 return
             
-            logger.info("[*] Seeding month tab with chart data...")
+            logger.info(f"[*] Seeding {len(all_data)} rows to month tab...")
             for item in all_data:
                 day = item['day']
                 units = item['value']
                 
-                # Create timestamp for this day at 23:59 IST (end of day)
                 date_ist = current_month_start + timedelta(days=day-1)
                 timestamp = date_ist.strftime('%Y-%m-%d %H:%M:%S')
                 hour = date_ist.hour
@@ -297,7 +289,7 @@ class UPPCLTracker:
                 ]
                 this_month_ws.append_row(row)
             
-            logger.info(f"[+] Seeded {len(all_data)} rows to month tab")
+            logger.info(f"[+] Seeded {len(all_data)} rows")
             
         except Exception as e:
             logger.warning(f"[!] Seeding error: {e}")
@@ -316,9 +308,12 @@ class UPPCLTracker:
             return "Unknown"
 
     def extract_current_day_units(self):
+        """Extract current day's total units - HANDLES MIDNIGHT"""
         try:
             ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
             day_of_month = ist_now.day
+            
+            logger.info(f"[DEBUG] Extracting units for day {day_of_month} of month {ist_now.month}")
             
             script = """
             var chart = Highcharts.charts[0];
@@ -333,8 +328,10 @@ class UPPCLTracker:
             """
             units = self.driver.execute_script(script, day_of_month)
             if units:
-                logger.info(f"[+] Units: {units} kWh")
+                logger.info(f"[+] Units for day {day_of_month}: {units} kWh")
                 return float(units)
+            
+            logger.warning(f"[!] Could not extract units for day {day_of_month}")
             return 0.0
         except Exception as e:
             logger.error(f"[!] Units error: {e}")
@@ -375,27 +372,34 @@ class UPPCLTracker:
         return consumption
 
     def get_last_hour_units(self):
-        """Get units from 1 hour ago (or last entry in Today tab)"""
+        """Get last hour's units from Today tab"""
         try:
             today_ws = self.worksheets['today']
             all_rows = today_ws.get_all_values()
+            
             if len(all_rows) > 1:
+                # Get the LAST row (most recent entry)
                 last_row = all_rows[-1]
                 last_units = float(last_row[2]) if last_row[2] else 0.0
-                logger.info(f"[*] Last hour units: {last_units}")
+                logger.info(f"[DEBUG] Last hour units from Today tab: {last_units}")
                 return last_units
+            
+            logger.info("[DEBUG] Today tab is empty (first entry of day)")
             return 0.0
-        except:
+        except Exception as e:
+            logger.warning(f"[!] Get last hour error: {e}")
             return 0.0
 
     def calculate_benchmark(self, hour_of_day):
-        """Calculate 3-day avg for this hour from This Month tab"""
+        """Calculate 3-day avg for this hour"""
         try:
             this_month_ws = self.worksheets['this_month']
             consumptions = []
             
             ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
             current_date = ist_now.date()
+            
+            logger.info(f"[DEBUG] Calculating benchmark for hour {hour_of_day} on date {current_date}")
 
             for days_back in range(1, 4):
                 check_date = current_date - timedelta(days=days_back)
@@ -406,10 +410,12 @@ class UPPCLTracker:
                             try:
                                 row_date = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date()
                                 row_hour = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').hour
+                                
                                 if row_date == check_date and row_hour == hour_of_day:
                                     hourly_consumption = float(row[3]) if len(row) > 3 and row[3] else 0.0
                                     if hourly_consumption > 0:
                                         consumptions.append(hourly_consumption)
+                                        logger.info(f"[DEBUG] Found benchmark entry: {row_date} {row_hour}:00 = {hourly_consumption}")
                             except:
                                 continue
                 except:
@@ -417,20 +423,101 @@ class UPPCLTracker:
 
             if consumptions:
                 benchmark = sum(consumptions) / len(consumptions)
-                logger.info(f"[+] Benchmark: {benchmark:.2f}")
+                logger.info(f"[+] Benchmark for hour {hour_of_day}: {benchmark:.2f}")
                 return round(benchmark, 2)
             
-            logger.info("[*] No benchmark data")
+            logger.info(f"[*] No benchmark data for hour {hour_of_day}")
             return None
 
         except Exception as e:
             logger.error(f"[!] Benchmark error: {e}")
             return None
 
+    def archive_old_data(self):
+        """Archive old data AFTER adding new entry"""
+        logger.info("[*] Checking for data to archive...")
+        try:
+            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            today_date = ist_now.date()
+            current_month = ist_now.month
+            current_year = ist_now.year
+            
+            logger.info(f"[DEBUG] Current date: {today_date}, month: {current_month}/{current_year}")
+            
+            # Archive day
+            today_ws = self.worksheets['today']
+            this_month_ws = self.worksheets['this_month']
+            
+            all_rows = today_ws.get_all_values()
+            
+            rows_to_move = []
+            rows_to_keep = [all_rows[0]]  # Header
+            
+            for row in all_rows[1:]:
+                if row and len(row) > 0:
+                    try:
+                        row_date = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date()
+                        if row_date < today_date:
+                            logger.info(f"[*] Archiving old row: {row[0]}")
+                            rows_to_move.append(row)
+                        else:
+                            rows_to_keep.append(row)
+                    except Exception as e:
+                        logger.warning(f"[!] Could not parse row date: {e}")
+                        rows_to_keep.append(row)
+            
+            if rows_to_move:
+                logger.info(f"[*] Moving {len(rows_to_move)} rows from Today to This Month...")
+                for row in rows_to_move:
+                    this_month_ws.append_row(row)
+                
+                # Clear Today and keep only today's data
+                today_ws.clear()
+                today_ws.append_rows(rows_to_keep)
+                logger.info("[+] Day archived")
+            
+            # Archive month
+            all_rows = this_month_ws.get_all_values()
+            
+            rows_to_move = []
+            rows_to_keep = [all_rows[0]]  # Header
+            
+            for row in all_rows[1:]:
+                if row and len(row) > 0:
+                    try:
+                        row_date = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S')
+                        if row_date.month != current_month or row_date.year != current_year:
+                            logger.info(f"[*] Archiving old month row: {row[0]}")
+                            rows_to_move.append(row)
+                        else:
+                            rows_to_keep.append(row)
+                    except Exception as e:
+                        logger.warning(f"[!] Could not parse month: {e}")
+                        rows_to_keep.append(row)
+            
+            if rows_to_move:
+                logger.info(f"[*] Moving {len(rows_to_move)} rows from This Month to Last Month...")
+                
+                last_month_ws = self.worksheets['last_month']
+                last_month_ws.clear()
+                last_month_ws.append_row(all_rows[0])  # Header
+                for row in rows_to_move:
+                    last_month_ws.append_row(row)
+                
+                # Clear This Month and keep current month
+                this_month_ws.clear()
+                this_month_ws.append_rows(rows_to_keep)
+                logger.info("[+] Month archived")
+        
+        except Exception as e:
+            logger.error(f"[!] Archive error: {e}")
+
     def add_row_to_today_sheet(self, timestamp, hour, current_units, hourly_consumption,
                                last_hour_units, benchmark, last_reading, balance, source):
         """Add row to Today tab"""
         try:
+            logger.info(f"[*] Adding row to Today tab: {timestamp}")
+            
             row = [
                 timestamp, hour, current_units, hourly_consumption,
                 last_hour_units, benchmark if benchmark else "N/A", 
@@ -448,114 +535,32 @@ class UPPCLTracker:
             logger.error(f"[!] Append error: {e}")
             return False
 
-    def archive_day(self):
-        """Move yesterday's data from Today to This Month"""
-        logger.info("[*] Checking if day changed...")
-        try:
-            today_ws = self.worksheets['today']
-            this_month_ws = self.worksheets['this_month']
-            
-            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-            today_date = ist_now.date()
-            
-            all_rows = today_ws.get_all_values()
-            
-            rows_to_move = []
-            rows_to_keep = [all_rows[0]]  # Keep header
-            
-            for row in all_rows[1:]:
-                if row and len(row) > 0:
-                    try:
-                        row_date = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date()
-                        if row_date < today_date:
-                            rows_to_move.append(row)
-                        else:
-                            rows_to_keep.append(row)
-                    except:
-                        rows_to_keep.append(row)
-            
-            if rows_to_move:
-                logger.info(f"[*] Moving {len(rows_to_move)} old rows to This Month...")
-                for row in rows_to_move:
-                    this_month_ws.append_row(row)
-                
-                # Keep only today's data
-                today_ws.clear()
-                today_ws.append_rows(rows_to_keep)
-                logger.info("[+] Day archived")
-        
-        except Exception as e:
-            logger.warning(f"[!] Archive error: {e}")
-
-    def archive_month(self):
-        """Move last month's data from This Month to Last Month"""
-        logger.info("[*] Checking if month changed...")
-        try:
-            this_month_ws = self.worksheets['this_month']
-            last_month_ws = self.worksheets['last_month']
-            
-            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-            current_month = ist_now.month
-            current_year = ist_now.year
-            
-            all_rows = this_month_ws.get_all_values()
-            
-            rows_to_move = []
-            rows_to_keep = [all_rows[0]]  # Keep header
-            
-            for row in all_rows[1:]:
-                if row and len(row) > 0:
-                    try:
-                        row_date = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S')
-                        if row_date.month != current_month or row_date.year != current_year:
-                            rows_to_move.append(row)
-                        else:
-                            rows_to_keep.append(row)
-                    except:
-                        rows_to_keep.append(row)
-            
-            if rows_to_move:
-                logger.info(f"[*] Moving {len(rows_to_move)} old rows to Last Month...")
-                
-                # Clear last month and add new data
-                last_month_ws.clear()
-                last_month_ws.append_row(all_rows[0])  # Add header
-                for row in rows_to_move:
-                    last_month_ws.append_row(row)
-                
-                # Keep only current month data
-                this_month_ws.clear()
-                this_month_ws.append_rows(rows_to_keep)
-                logger.info("[+] Month archived")
-        
-        except Exception as e:
-            logger.warning(f"[!] Month archive error: {e}")
-
     def run_once(self):
         try:
-            logger.info("[*] Starting tracker...")
+            logger.info("\n" + "="*80)
+            logger.info("TRACKER RUN STARTED")
+            logger.info("="*80)
+            
+            utc_now = datetime.utcnow()
+            ist_now = utc_now + timedelta(hours=5, minutes=30)
+            logger.info(f"[DEBUG] UTC Time: {utc_now.strftime('%Y-%m-%d %H:%M:%S')}")
+            logger.info(f"[DEBUG] IST Time: {ist_now.strftime('%Y-%m-%d %H:%M:%S')}")
+            
             self.setup_chrome_driver()
 
             if not self.login():
                 logger.error("[!] Login failed")
                 return False
 
-            # Seed on first run
+            # Seed on first run ONLY
             self.seed_current_month_data()
             
-            # Archive old data
-            self.archive_day()
-            self.archive_month()
-
             time.sleep(2)
 
-            utc_now = datetime.utcnow()
-            ist_now = utc_now + timedelta(hours=5, minutes=30)
-            
             timestamp = ist_now.strftime('%Y-%m-%d %H:%M:%S')
             hour = ist_now.hour
             
-            logger.info(f"[*] Time: {timestamp} IST")
+            logger.info(f"[*] Collecting data for: {timestamp} IST (Hour: {hour})")
 
             current_units = self.extract_current_day_units()
             last_hour_units = self.get_last_hour_units()
@@ -565,23 +570,32 @@ class UPPCLTracker:
             balance = self.extract_balance()
             source = self.extract_source()
 
+            logger.info(f"[DEBUG] Data collected: units={current_units}, consumption={hourly_consumption}, benchmark={benchmark}")
+
             success = self.add_row_to_today_sheet(
                 timestamp, hour, current_units, hourly_consumption,
                 last_hour_units, benchmark, last_reading, balance, source
             )
 
             if success:
+                # Archive AFTER adding new row
+                self.archive_old_data()
                 logger.info("[+] Tracker completed successfully")
 
             return success
 
         except Exception as e:
             logger.error(f"[!] Tracker error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             return False
 
         finally:
             if self.driver:
                 self.driver.quit()
+            logger.info("="*80)
+            logger.info("TRACKER RUN ENDED")
+            logger.info("="*80 + "\n")
 
 
 @app.route('/', methods=['GET', 'POST'])
