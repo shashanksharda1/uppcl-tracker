@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker - SMART EXTRACTION
-Intelligently handles both hourly and daily chart modes
+UPPCL Tracker - LOGIN FAILURE DEBUG
+Capture exact reason why login fails at midnight
 """
 import json
 import os
@@ -49,60 +49,38 @@ class UPPCLTracker:
                 raise ValueError("SERVICE_ACCOUNT_JSON environment variable not set")
 
             service_account_info = json.loads(service_account_json)
-
             credentials = Credentials.from_service_account_info(
                 service_account_info,
-                scopes=[
-                    'https://www.googleapis.com/auth/spreadsheets',
-                    'https://www.googleapis.com/auth/drive'
-                ]
+                scopes=['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
             )
-
             credentials.refresh(Request())
-            logger.info("[+] Credentials loaded")
-
             self.gs = gspread.authorize(credentials)
             spreadsheet = self.gs.open(self.sheet_name)
-            logger.info(f"[+] Opened spreadsheet: {self.sheet_name}")
-
             self._setup_worksheets(spreadsheet)
             logger.info("[+] Google Sheets ready!")
-
         except Exception as e:
             logger.error(f"[!] Google Sheets error: {e}")
             raise
 
     def _setup_worksheets(self, spreadsheet):
-        sheet_names = {
-            'today': 'Today',
-            'this_month': 'This Month',
-            'last_month': 'Last Month'
-        }
-
+        sheet_names = {'today': 'Today', 'this_month': 'This Month', 'last_month': 'Last Month'}
         try:
             existing_sheets = {ws.title: ws for ws in spreadsheet.worksheets()}
-
             for key, name in sheet_names.items():
                 if name not in existing_sheets:
                     ws = spreadsheet.add_worksheet(title=name, rows=2000, cols=10)
                     self._add_headers(ws)
-                    logger.info(f"[+] Created worksheet: {name}")
                 else:
                     ws = existing_sheets[name]
-                    logger.info(f"[+] Using existing worksheet: {name}")
-
                 self.worksheets[key] = ws
-
         except Exception as e:
             logger.error(f"[!] Worksheet setup error: {e}")
             raise
 
     def _add_headers(self, worksheet):
-        headers = [
-            'Timestamp (IST)', 'Hour (IST)', 'Current Day Units (kWh)', 'Hourly Consumption (kWh)',
-            'Last Hour Units (kWh)', 'Benchmark (3-day avg)', 'Above Benchmark?',
-            'Last Reading Time', 'Account Balance (Rs)', 'Source'
-        ]
+        headers = ['Timestamp (IST)', 'Hour (IST)', 'Current Day Units (kWh)', 'Hourly Consumption (kWh)',
+                   'Last Hour Units (kWh)', 'Benchmark (3-day avg)', 'Above Benchmark?',
+                   'Last Reading Time', 'Account Balance (Rs)', 'Source']
         worksheet.append_row(headers)
 
     def setup_chrome_driver(self):
@@ -116,23 +94,35 @@ class UPPCLTracker:
             chrome_options.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
 
             result = subprocess.run(['which', 'chromedriver'], capture_output=True, text=True)
-            if result.returncode != 0:
-                raise Exception("ChromeDriver not found")
-
             chromedriver_bin = result.stdout.strip()
-
+            
             chrome_result = subprocess.run(['which', 'google-chrome'], capture_output=True, text=True)
             if chrome_result.returncode == 0:
-                chrome_bin = chrome_result.stdout.strip()
-                chrome_options.binary_location = chrome_bin
+                chrome_options.binary_location = chrome_result.stdout.strip()
 
             service = Service(chromedriver_bin)
             self.driver = webdriver.Chrome(service=service, options=chrome_options)
             logger.info("[+] Chrome WebDriver ready")
-
         except Exception as e:
             logger.error(f"[!] WebDriver error: {e}")
             raise
+
+    def check_page_source(self, label):
+        """Debug: check page source for issues"""
+        try:
+            source = self.driver.page_source
+            logger.info(f"[DEBUG] {label} - Page source length: {len(source)}")
+            
+            # Check for error messages
+            if "error" in source.lower():
+                logger.warning(f"[DEBUG] {label} - Found 'error' in page")
+            if "invalid" in source.lower():
+                logger.warning(f"[DEBUG] {label} - Found 'invalid' in page")
+            if "failed" in source.lower():
+                logger.warning(f"[DEBUG] {label} - Found 'failed' in page")
+                
+        except Exception as e:
+            logger.warning(f"[DEBUG] Could not check page source: {e}")
 
     def solve_captcha(self):
         logger.info("[*] Solving captcha...")
@@ -159,7 +149,6 @@ class UPPCLTracker:
             
             logger.info(f"[+] Sent captcha: '{captcha_answer}'")
             time.sleep(2)
-            
             return True
                 
         except Exception as e:
@@ -168,216 +157,114 @@ class UPPCLTracker:
 
     def login(self):
         try:
-            logger.info("[*] Logging in...")
+            logger.info("\n" + "="*80)
+            logger.info("LOGIN ATTEMPT")
+            logger.info("="*80)
+            
+            logger.info("[*] Navigating to login page...")
             self.driver.get("https://uppclmp.myxenius.com/login.html")
-
+            logger.info(f"[DEBUG] Page loaded, title: {self.driver.title}")
+            self.check_page_source("AFTER_PAGE_LOAD")
+            
+            logger.info("[*] Waiting for username field...")
             username_field = WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.ID, "name"))
             )
             username_field.send_keys(self.username)
+            logger.info(f"[DEBUG] Username sent")
 
             password_field = self.driver.find_element(By.ID, "password")
             password_field.send_keys(self.password)
+            logger.info(f"[DEBUG] Password sent")
 
             self.solve_captcha()
-            
             time.sleep(1)
             
+            # Check for pre-submit alerts
             try:
                 alert = WebDriverWait(self.driver, 1).until(EC.alert_is_present())
+                logger.warning(f"[!] Pre-submit alert: {alert.text}")
                 alert.dismiss()
                 time.sleep(1)
             except:
-                pass
+                logger.info("[*] No pre-submit alert")
 
+            logger.info("[*] Clicking submit...")
             submit_button = self.driver.find_element(By.ID, "submitBtn")
             submit_button.click()
+            logger.info("[DEBUG] Submit button clicked")
             
             time.sleep(2)
             
+            # Check page after submit
+            self.check_page_source("AFTER_SUBMIT")
+            logger.info(f"[DEBUG] Current URL after submit: {self.driver.current_url}")
+            
+            # Check for post-submit alerts
             try:
-                alert = WebDriverWait(self.driver, 1).until(EC.alert_is_present())
+                alert = WebDriverWait(self.driver, 2).until(EC.alert_is_present())
+                alert_text = alert.text
+                logger.error(f"[!] ❌ POST-SUBMIT ALERT: '{alert_text}'")
                 alert.dismiss()
                 time.sleep(2)
                 return False
             except:
-                pass
+                logger.info("[*] No post-submit alert")
 
-            WebDriverWait(self.driver, 15).until(
-                EC.presence_of_element_located((By.ID, "chartContainerHourly"))
-            )
-
-            logger.info("[+] Login successful!")
-            return True
+            # Wait for chart with extended timeout
+            logger.info("[*] Waiting for chart (15 sec timeout)...")
+            try:
+                WebDriverWait(self.driver, 15).until(
+                    EC.presence_of_element_located((By.ID, "chartContainerHourly"))
+                )
+                logger.info("[+] ✓✓✓ LOGIN SUCCESSFUL!")
+                return True
+            except Exception as e:
+                logger.error(f"[!] Chart not found after 15 sec: {e}")
+                logger.error(f"[DEBUG] Current URL: {self.driver.current_url}")
+                self.check_page_source("CHART_NOT_FOUND")
+                
+                # Try to find any content
+                try:
+                    page_title = self.driver.find_element(By.TAG_NAME, "h1").text
+                    logger.error(f"[DEBUG] Page heading: {page_title}")
+                except:
+                    pass
+                
+                return False
 
         except Exception as e:
             logger.error(f"[!] Login error: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            self.check_page_source("LOGIN_EXCEPTION")
             return False
 
-    def detect_chart_type(self):
-        """Detect if chart is showing hourly or daily data"""
-        try:
-            script = """
-            if (Highcharts.charts.length > 0) {
-                var chart = Highcharts.charts[0];
-                if (chart && chart.series && chart.series.length > 0) {
-                    var seriesData = chart.series[0].data;
-                    var dataPoints = seriesData.length;
-                    // Hourly chart has ~24-25 points, daily has ~28-31
-                    if (dataPoints <= 25) {
-                        return 'HOURLY';
-                    } else {
-                        return 'DAILY';
-                    }
-                }
-            }
-            return 'UNKNOWN';
-            """
-            chart_type = self.driver.execute_script(script)
-            logger.info(f"[DEBUG] Chart type detected: {chart_type}")
-            return chart_type
-        except Exception as e:
-            logger.warning(f"[!] Could not detect chart type: {e}")
-            return 'UNKNOWN'
-
-    def extract_current_day_units_smart(self):
-        """Smart extraction: handles both hourly and daily charts"""
+    def extract_current_day_units(self):
+        """Simple extraction"""
         try:
             ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-            hour = ist_now.hour
             day_of_month = ist_now.day
             
-            logger.info(f"[*] Smart extraction for {ist_now.strftime('%Y-%m-%d %H:%M')} IST")
-            
-            # Detect chart type
-            chart_type = self.detect_chart_type()
-            
-            if chart_type == 'HOURLY':
-                logger.info("[*] Chart is HOURLY - extracting current hour...")
-                script = """
-                var chart = Highcharts.charts[0];
-                if (chart && chart.series && chart.series.length > 0) {
-                    var seriesData = chart.series[0].data;
-                    // For hourly chart, hour index is the hour of day
-                    var hourIndex = arguments[0];
-                    if (seriesData && seriesData[hourIndex]) {
-                        return seriesData[hourIndex].y;
-                    }
+            script = """
+            var chart = Highcharts.charts[0];
+            if (chart && chart.series && chart.series.length > 0) {
+                var seriesData = chart.series[0].data;
+                var dayIndex = arguments[0] - 1;
+                if (seriesData && seriesData[dayIndex]) {
+                    return seriesData[dayIndex].y;
                 }
-                return null;
-                """
-                units = self.driver.execute_script(script, hour)
-                if units is not None:
-                    logger.info(f"[+] Extracted hourly units at {hour}:00 = {units} kWh")
-                    return float(units)
-            
-            elif chart_type == 'DAILY':
-                logger.info("[*] Chart is DAILY - extracting current day's total...")
-                script = """
-                var chart = Highcharts.charts[0];
-                if (chart && chart.series && chart.series.length > 0) {
-                    var seriesData = chart.series[0].data;
-                    // For daily chart, day index is day-1
-                    var dayIndex = arguments[0] - 1;
-                    if (seriesData && seriesData[dayIndex]) {
-                        return seriesData[dayIndex].y;
-                    }
-                }
-                return null;
-                """
-                units = self.driver.execute_script(script, day_of_month)
-                if units is not None:
-                    logger.info(f"[+] Extracted daily units for day {day_of_month} = {units} kWh")
-                    return float(units)
-            
-            logger.warning("[!] Could not extract units - chart type unknown")
+            }
+            return null;
+            """
+            units = self.driver.execute_script(script, day_of_month)
+            if units:
+                logger.info(f"[+] Units: {units}")
+                return float(units)
             return 0.0
-                
         except Exception as e:
             logger.error(f"[!] Extraction error: {e}")
             return 0.0
-
-    def get_all_chart_data(self):
-        logger.info("[*] Extracting all chart data...")
-        try:
-            script = """
-            var chart = Highcharts.charts[0];
-            var data = [];
-            if (chart && chart.series && chart.series.length > 0) {
-                var seriesData = chart.series[0].data;
-                if (seriesData) {
-                    for (let i = 0; i < seriesData.length; i++) {
-                        if (seriesData[i] && seriesData[i].y) {
-                            data.push({
-                                index: i,
-                                value: seriesData[i].y
-                            });
-                        }
-                    }
-                }
-            }
-            return data;
-            """
-            
-            all_data = self.driver.execute_script(script)
-            logger.info(f"[+] Extracted {len(all_data)} data points from chart")
-            return all_data
-            
-        except Exception as e:
-            logger.warning(f"[!] Could not extract all chart data: {e}")
-            return []
-
-    def seed_current_month_data(self):
-        logger.info("[*] Seeding current month tab...")
-        try:
-            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-            current_month_start = ist_now.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            
-            all_data = self.get_all_chart_data()
-            
-            if not all_data:
-                logger.warning("[*] No chart data to seed")
-                return
-            
-            this_month_ws = self.worksheets['this_month']
-            existing_rows = this_month_ws.get_all_values()
-            
-            if len(existing_rows) > 1:
-                logger.info("[*] Month tab already has data, skipping seed")
-                return
-            
-            logger.info(f"[*] Seeding {len(all_data)} rows...")
-            for item in all_data:
-                day = item['index'] + 1
-                units = item['value']
-                
-                date_ist = current_month_start + timedelta(days=day-1)
-                timestamp = date_ist.strftime('%Y-%m-%d %H:%M:%S')
-                hour = date_ist.hour
-                
-                row = [
-                    timestamp, hour, units, 0, 0, "N/A", "N/A",
-                    "Seeded from chart", "N/A", "Chart"
-                ]
-                this_month_ws.append_row(row)
-            
-            logger.info(f"[+] Seeded {len(all_data)} rows")
-            
-        except Exception as e:
-            logger.warning(f"[!] Seeding error: {e}")
-
-    def extract_source(self):
-        try:
-            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
-            h1 = soup.find('h1', class_='clearfix')
-            if h1:
-                text = h1.get_text()
-                match = re.search(r'Source\s*:\s*(\w+)', text, re.IGNORECASE)
-                if match:
-                    return match.group(1)
-            return "Unknown"
-        except:
-            return "Unknown"
 
     def extract_last_reading(self):
         try:
@@ -401,164 +288,58 @@ class UPPCLTracker:
         except:
             return "N/A"
 
-    def calculate_hourly_consumption(self, current_units, last_hour_units):
-        if last_hour_units is None or last_hour_units == 0:
-            return 0.0
-        consumption = current_units - last_hour_units
-        return max(0.0, consumption)
-
-    def get_last_hour_units(self):
+    def extract_source(self):
         try:
-            today_ws = self.worksheets['today']
-            all_rows = today_ws.get_all_values()
-            if len(all_rows) > 1:
-                last_row = all_rows[-1]
-                last_units = float(last_row[2]) if last_row[2] else 0.0
-                return last_units
-            return 0.0
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            h1 = soup.find('h1', class_='clearfix')
+            if h1:
+                text = h1.get_text()
+                match = re.search(r'Source\s*:\s*(\w+)', text, re.IGNORECASE)
+                if match:
+                    return match.group(1)
+            return "Unknown"
         except:
-            return 0.0
-
-    def calculate_benchmark(self, hour_of_day):
-        try:
-            this_month_ws = self.worksheets['this_month']
-            consumptions = []
-            
-            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-            current_date = ist_now.date()
-
-            for days_back in range(1, 4):
-                check_date = current_date - timedelta(days=days_back)
-                try:
-                    all_rows = this_month_ws.get_all_values()
-                    for row in all_rows[1:]:
-                        if row and len(row) > 0:
-                            try:
-                                row_date = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date()
-                                row_hour = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').hour
-                                
-                                if row_date == check_date and row_hour == hour_of_day:
-                                    hourly_consumption = float(row[3]) if len(row) > 3 and row[3] else 0.0
-                                    if hourly_consumption > 0:
-                                        consumptions.append(hourly_consumption)
-                            except:
-                                continue
-                except:
-                    pass
-
-            if consumptions:
-                return round(sum(consumptions) / len(consumptions), 2)
-            return None
-
-        except Exception as e:
-            logger.error(f"[!] Benchmark error: {e}")
-            return None
-
-    def add_row_to_today_sheet(self, timestamp, hour, current_units, hourly_consumption,
-                               last_hour_units, benchmark, last_reading, balance, source):
-        try:
-            row = [
-                timestamp, hour, current_units, hourly_consumption,
-                last_hour_units, benchmark if benchmark else "N/A", 
-                "YES" if benchmark and hourly_consumption > benchmark else "NO",
-                last_reading, balance, source
-            ]
-
-            today_ws = self.worksheets['today']
-            today_ws.append_row(row)
-            logger.info("[+] Row added to Today tab")
-            return True
-
-        except Exception as e:
-            logger.error(f"[!] Append error: {e}")
-            return False
-
-    def archive_old_data(self):
-        logger.info("[*] Checking for data to archive...")
-        try:
-            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-            today_date = ist_now.date()
-            current_month = ist_now.month
-            current_year = ist_now.year
-            
-            today_ws = self.worksheets['today']
-            this_month_ws = self.worksheets['this_month']
-            
-            all_rows = today_ws.get_all_values()
-            rows_to_move = []
-            rows_to_keep = [all_rows[0]]
-            
-            for row in all_rows[1:]:
-                if row and len(row) > 0:
-                    try:
-                        row_date = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date()
-                        if row_date < today_date:
-                            rows_to_move.append(row)
-                        else:
-                            rows_to_keep.append(row)
-                    except:
-                        rows_to_keep.append(row)
-            
-            if rows_to_move:
-                logger.info(f"[*] Moving {len(rows_to_move)} rows to This Month...")
-                for row in rows_to_move:
-                    this_month_ws.append_row(row)
-                today_ws.clear()
-                today_ws.append_rows(rows_to_keep)
-                logger.info("[+] Day archived")
-        
-        except Exception as e:
-            logger.error(f"[!] Archive error: {e}")
+            return "Unknown"
 
     def run_once(self):
         try:
-            logger.info("\n" + "="*80)
-            logger.info("TRACKER RUN STARTED")
-            logger.info("="*80)
+            logger.info("\n\n")
+            logger.info("╔" + "="*78 + "╗")
+            logger.info("║" + " "*25 + "UPPCL TRACKER RUN" + " "*37 + "║")
+            logger.info("╚" + "="*78 + "╝")
+            
+            ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+            logger.info(f"[*] IST Time: {ist_now.strftime('%Y-%m-%d %H:%M:%S')}")
             
             self.setup_chrome_driver()
 
             if not self.login():
-                logger.error("[!] Login failed")
+                logger.error("[!] ❌ LOGIN FAILED - STOPPING HERE FOR DEBUGGING")
                 return False
 
-            self.seed_current_month_data()
-            
             time.sleep(2)
-
+            
             ist_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
             timestamp = ist_now.strftime('%Y-%m-%d %H:%M:%S')
             hour = ist_now.hour
 
-            current_units = self.extract_current_day_units_smart()
-            last_hour_units = self.get_last_hour_units()
-            hourly_consumption = self.calculate_hourly_consumption(current_units, last_hour_units)
-            benchmark = self.calculate_benchmark(hour)
+            logger.info(f"[*] Extracting data...")
+            current_units = self.extract_current_day_units()
             last_reading = self.extract_last_reading()
             balance = self.extract_balance()
             source = self.extract_source()
 
-            success = self.add_row_to_today_sheet(
-                timestamp, hour, current_units, hourly_consumption,
-                last_hour_units, benchmark, last_reading, balance, source
-            )
-
-            if success:
-                self.archive_old_data()
-                logger.info("[+] Tracker completed successfully")
-
-            return success
+            logger.info(f"\n[+] Extracted: {current_units} kWh, {last_reading}, {balance}")
+            return True
 
         except Exception as e:
-            logger.error(f"[!] Tracker error: {e}")
+            logger.error(f"[!] Error: {e}")
             return False
 
         finally:
             if self.driver:
                 self.driver.quit()
             logger.info("="*80)
-            logger.info("TRACKER RUN ENDED")
-            logger.info("="*80 + "\n")
 
 
 @app.route('/', methods=['GET', 'POST'])
@@ -575,9 +356,9 @@ def trigger():
         success = tracker.run_once()
 
         if success:
-            return jsonify({'status': 'success', 'message': 'Tracker executed'}), 200
+            return jsonify({'status': 'success'}), 200
         else:
-            return jsonify({'status': 'error', 'message': 'Tracker failed'}), 500
+            return jsonify({'status': 'error'}), 500
 
     except Exception as e:
         logger.error(f"[!] Error: {e}")
