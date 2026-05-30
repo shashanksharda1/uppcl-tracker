@@ -1,39 +1,32 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker v3.9 - Fixed:
+UPPCL Tracker v3.9 - Based on last working v3.7
+Only 2 changes made on top of working code:
 
-BUG 1 (Chart picks wrong month):
-  - extract_current_day_units() used datetime.now().day → UTC day
-  - At IST 00:00-05:30, UTC is still PREVIOUS day
-  - So day_of_month was WRONG → chart returned null → 0.0
-  - FIX: Always use IST day for chart index
+CHANGE 1: extract_current_day_units()
+  - OLD: Highcharts.charts[0]  ← hardcoded, can be null or previous-month chart
+  - NEW: Walk Highcharts.charts[], find first non-null = always current month chart
+  - Also returns debug info (chartIndex, barIndex, source) in logs
 
-BUG 2 (Fails 12am-5:30am IST):
-  - ALL datetime.now() calls return UTC on GitHub Actions
-  - _setup_worksheets() → wrong sheet name (yesterday's date)
-  - archive_old_data()  → wrong date comparison
-  - calculate_benchmark() → wrong date range
-  - FIX: Use IST datetime everywhere via get_ist_now()
+CHANGE 2: get_last_hour_units()
+  - OLD: Returns all_rows[-1] blindly ← at midnight returns YESTERDAY's last row
+  - NEW: Filters rows by today's IST date string first, then picks last matching row
+         If no row for today yet → returns 0.0 (correct: fresh day start)
 
-BUG 3 (Previous month chart):
-  - At month boundary: UTC still in old month, IST in new month
-  - dayIndex=30 on a chart with only 1 bar → null → 0.0
-  - FIX: IST day used for index + fallback to last non-zero bar
-
-ROOT CAUSE SUMMARY:
-  datetime.now() = UTC on GitHub Actions cloud runner
-  datetime.now() = IST on your local Mac (system timezone = IST)
-  This is why it works locally but fails on cloud during 00:00-05:30 IST
+Everything else is IDENTICAL to the last working v3.7 code.
 """
 
+import json
 import os
-import sys
 import logging
 import time
 import re
 import subprocess
-from datetime import datetime, timedelta, timezone
+import traceback
+from datetime import datetime, timedelta
+import pytz
 
+from flask import Flask, jsonify
 import gspread
 from google.auth.transport.requests import Request
 from google.oauth2.service_account import Credentials
@@ -43,221 +36,348 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.chrome.service import Service
+from selenium.common.exceptions import TimeoutException
 from bs4 import BeautifulSoup
 
-# ─── IST Timezone ──────────────────────────────────────────────────────────────
-IST = timezone(timedelta(hours=5, minutes=30))
-
-def get_ist_now():
-    """Always return current time in IST regardless of system timezone"""
-    return datetime.now(tz=timezone.utc).astimezone(IST)
-
-# ─── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('uppcl_tracker.log'),
-        logging.StreamHandler()
-    ]
+    handlers=[logging.StreamHandler()]
 )
+
 logger = logging.getLogger(__name__)
 
+app = Flask(__name__)
 
-class UPPCLEnhancedTracker:
+IST = pytz.timezone('Asia/Kolkata')
 
-    def __init__(self, username, password, sheet_name, service_account_path):
+
+class UPPCLTracker:
+
+    def __init__(self, username, password, sheet_name):
         self.username = username
         self.password = password
         self.sheet_name = sheet_name
-        self.service_account_path = service_account_path
         self.gs = None
-        self.spreadsheet = None
         self.worksheets = {}
         self.driver = None
 
-    # ─── Google Sheets ─────────────────────────────────────────────────────────
+    # =========================================================
+    # TIMEZONE HELPERS
+    # =========================================================
+
+    def get_ist_now(self):
+        return datetime.now(IST)
+
+    # =========================================================
+    # GOOGLE SHEETS  (unchanged from v3.7)
+    # =========================================================
 
     def init_google_sheets(self):
+
         logger.info("[*] Initializing Google Sheets...")
+
         try:
-            credentials = Credentials.from_service_account_file(
-                self.service_account_path,
+            service_account_json = os.environ.get('SERVICE_ACCOUNT_JSON')
+
+            if not service_account_json:
+                raise ValueError("SERVICE_ACCOUNT_JSON environment variable not set")
+
+            service_account_info = json.loads(service_account_json)
+
+            credentials = Credentials.from_service_account_info(
+                service_account_info,
                 scopes=[
                     'https://www.googleapis.com/auth/spreadsheets',
                     'https://www.googleapis.com/auth/drive'
                 ]
             )
+
             credentials.refresh(Request())
-            logger.info("[+] Credentials created")
 
             self.gs = gspread.authorize(credentials)
-            self.spreadsheet = self.gs.open(self.sheet_name)
-            logger.info(f"[+] Opened: {self.sheet_name}")
 
-            self._setup_worksheets()
+            spreadsheet = self.gs.open(self.sheet_name)
+
+            self._setup_worksheets(spreadsheet)
+
             logger.info("[+] Google Sheets ready!")
 
         except Exception as e:
-            logger.error(f"[!] Google Sheets init error: {e}")
+            logger.error(f"[!] Google Sheets error: {e}")
+            logger.error(traceback.format_exc())
             raise
 
-    def _setup_worksheets(self):
-        """
-        Create/get worksheets using IST date.
-        FIX: was using datetime.now() (UTC on cloud) → wrong date during 00:00-05:30 IST
-        """
-        ist = get_ist_now()                                     # ← always IST
-        today_str      = ist.strftime('%Y-%m-%d')
-        this_month_str = ist.strftime('%B %Y')
-        last_month_ist = ist - timedelta(days=ist.day)          # 1 day before 1st = last month
-        last_month_str = last_month_ist.strftime('%B %Y')
+    def _setup_worksheets(self, spreadsheet):
 
         sheet_names = {
-            'today':      f"Today ({today_str})",
-            'this_month': f"This Month ({this_month_str})",
-            'last_month': f"Last Month ({last_month_str})"
+            'today': 'Today',
+            'this_month': 'This Month',
+            'last_month': 'Last Month'
         }
 
-        logger.info(f"[*] IST date: {today_str} | Sheets: {list(sheet_names.values())}")
-
-        existing = [ws.title for ws in self.spreadsheet.worksheets()]
+        existing_sheets = {ws.title: ws for ws in spreadsheet.worksheets()}
 
         for key, name in sheet_names.items():
-            if name not in existing:
-                ws = self.spreadsheet.add_worksheet(title=name, rows=1000, cols=12)
+
+            if name not in existing_sheets:
+                ws = spreadsheet.add_worksheet(
+                    title=name,
+                    rows=2000,
+                    cols=10
+                )
                 self._add_headers(ws)
-                logger.info(f"[+] Created: {name}")
             else:
-                ws = self.spreadsheet.worksheet(name)
-                logger.info(f"[+] Using: {name}")
+                ws = existing_sheets[name]
+
             self.worksheets[key] = ws
 
-    def _add_headers(self, ws):
+    def _add_headers(self, worksheet):
+
         headers = [
             'Timestamp (IST)',
             'Hour (IST)',
             'Current Day Units (kWh)',
             'Hourly Consumption (kWh)',
             'Last Hour Units (kWh)',
-            'Benchmark 3-day avg (kWh)',
+            'Benchmark (3-day avg)',
             'Above Benchmark?',
             'Last Reading Time',
-            'Account Balance (₹)',
+            'Account Balance (Rs)',
             'Source'
         ]
-        ws.append_row(headers)
 
-    # ─── Chrome WebDriver ───────────────────────────────────────────────────────
+        worksheet.append_row(headers)
+
+    # =========================================================
+    # CHROME DRIVER  (unchanged from v3.7)
+    # =========================================================
 
     def setup_chrome_driver(self):
+
         logger.info("[*] Setting up Chrome WebDriver...")
+
         try:
-            opts = Options()
-            opts.add_argument('--headless')
-            opts.add_argument('--no-sandbox')
-            opts.add_argument('--disable-dev-shm-usage')
-            opts.add_argument('--disable-blink-features=AutomationControlled')
-            opts.add_argument('user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36')
+            chrome_options = Options()
 
-            if os.getenv('USE_SYSTEM_CHROME') == 'true' or os.getenv('GITHUB_ACTIONS') == 'true':
-                logger.info("[*] GitHub Actions: auto-detecting Chrome/ChromeDriver")
+            chrome_options.add_argument('--headless=new')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-blink-features=AutomationControlled')
+            chrome_options.add_argument('--window-size=1920,1080')
 
-                # Find chromedriver
-                r = subprocess.run(['which', 'chromedriver'], capture_output=True, text=True)
-                if r.returncode != 0:
-                    raise Exception("chromedriver not found in PATH")
-                chromedriver = r.stdout.strip()
-                logger.info(f"[*] chromedriver: {chromedriver}")
+            chrome_options.add_argument(
+                'user-agent=Mozilla/5.0 '
+                '(Windows NT 10.0; Win64; x64) '
+                'AppleWebKit/537.36 '
+                '(KHTML, like Gecko) '
+                'Chrome/125.0.0.0 Safari/537.36'
+            )
 
-                # Find Chrome binary
-                chrome_r = subprocess.run(['which', 'google-chrome'], capture_output=True, text=True)
-                if chrome_r.returncode == 0:
-                    opts.binary_location = chrome_r.stdout.strip()
-                    logger.info(f"[*] Chrome: {opts.binary_location}")
-                else:
-                    for p in ['/usr/bin/google-chrome', '/usr/bin/chromium-browser', '/snap/bin/chromium']:
-                        if os.path.exists(p):
-                            opts.binary_location = p
-                            logger.info(f"[*] Chrome: {p}")
-                            break
+            result = subprocess.run(
+                ['which', 'chromedriver'],
+                capture_output=True,
+                text=True
+            )
 
-                self.driver = webdriver.Chrome(service=Service(chromedriver), options=opts)
-                logger.info("[+] Chrome ready (GitHub Actions)")
-            else:
-                from webdriver_manager.chrome import ChromeDriverManager
-                self.driver = webdriver.Chrome(
-                    service=Service(ChromeDriverManager().install()), options=opts)
-                logger.info("[+] Chrome ready (local)")
+            chromedriver_bin = result.stdout.strip()
+
+            chrome_result = subprocess.run(
+                ['which', 'google-chrome'],
+                capture_output=True,
+                text=True
+            )
+
+            if chrome_result.returncode == 0:
+                chrome_options.binary_location = chrome_result.stdout.strip()
+
+            service = Service(chromedriver_bin)
+
+            self.driver = webdriver.Chrome(
+                service=service,
+                options=chrome_options
+            )
+
+            self.driver.delete_all_cookies()
+
+            logger.info("[+] Chrome WebDriver ready")
 
         except Exception as e:
             logger.error(f"[!] WebDriver error: {e}")
+            logger.error(traceback.format_exc())
             raise
 
-    # ─── Login ─────────────────────────────────────────────────────────────────
+    # =========================================================
+    # CAPTCHA  (unchanged from v3.7)
+    # =========================================================
 
     def solve_captcha(self):
+
+        logger.info("[*] Solving captcha...")
+
         try:
-            captcha_div = WebDriverWait(self.driver, 5).until(
+            captcha_div = WebDriverWait(self.driver, 10).until(
                 EC.presence_of_element_located((By.ID, "captchaText"))
             )
-            answer = captcha_div.get_attribute('data-answer')
-            logger.info(f"[+] Captcha: {answer}")
-            inp = self.driver.find_element(By.ID, "captchaInput")
-            inp.clear()
-            inp.send_keys(answer)
+
+            data_answer = captcha_div.get_attribute('data-answer')
+
+            logger.info(f"[*] Captcha data-answer: {data_answer}")
+
+            if data_answer and data_answer.strip():
+                captcha_answer = data_answer.strip()
+            else:
+                captcha_answer = self.driver.execute_script(
+                    "return document.getElementById('captchaText').textContent.trim();"
+                )
+
+            logger.info(f"[+] Captcha Answer: {captcha_answer}")
+
+            captcha_input = self.driver.find_element(By.ID, "captchaInput")
+            captcha_input.clear()
+            captcha_input.send_keys(captcha_answer)
+
+            time.sleep(2)
+
             return True
+
         except Exception as e:
             logger.error(f"[!] Captcha error: {e}")
+            logger.error(traceback.format_exc())
             return False
+
+    # =========================================================
+    # DEBUG  (unchanged from v3.7)
+    # =========================================================
+
+    def save_debug_files(self, prefix="debug"):
+
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            screenshot_path = f"/tmp/{prefix}_{timestamp}.png"
+            html_path = f"/tmp/{prefix}_{timestamp}.html"
+
+            self.driver.save_screenshot(screenshot_path)
+
+            with open(html_path, "w", encoding="utf-8") as f:
+                f.write(self.driver.page_source)
+
+            logger.error(f"[!] Screenshot saved: {screenshot_path}")
+            logger.error(f"[!] HTML saved: {html_path}")
+
+        except Exception as e:
+            logger.error(f"[!] Failed saving debug files: {e}")
+
+    # =========================================================
+    # LOGIN  (unchanged from v3.7)
+    # =========================================================
 
     def login(self):
+
         try:
-            logger.info("[*] Logging in...")
+            logger.info("[*] Opening login page...")
+
             self.driver.get("https://uppclmp.myxenius.com/login.html")
 
-            WebDriverWait(self.driver, 10).until(
+            logger.info(f"[*] Current URL: {self.driver.current_url}")
+
+            username_field = WebDriverWait(self.driver, 20).until(
                 EC.presence_of_element_located((By.ID, "name"))
-            ).send_keys(self.username)
+            )
 
-            self.driver.find_element(By.ID, "password").send_keys(self.password)
-            self.solve_captcha()
-            self.driver.find_element(By.ID, "submitBtn").click()
+            password_field = self.driver.find_element(By.ID, "password")
 
-            WebDriverWait(self.driver, 15).until(
+            username_field.clear()
+            username_field.send_keys(self.username)
+
+            password_field.clear()
+            password_field.send_keys(self.password)
+
+            logger.info("[+] Username & password entered")
+
+            captcha_success = self.solve_captcha()
+
+            if not captcha_success:
+                logger.error("[!] Captcha solve failed")
+                self.save_debug_files("captcha_failure")
+                return False
+
+            submit_button = WebDriverWait(self.driver, 10).until(
+                EC.element_to_be_clickable((By.ID, "submitBtn"))
+            )
+
+            logger.info("[*] Clicking submit button...")
+
+            time.sleep(2)
+
+            submit_button.click()
+
+            logger.info("[*] Submit clicked")
+
+            time.sleep(5)
+
+            # Check for alerts (login errors)
+            try:
+                alert = WebDriverWait(self.driver, 5).until(EC.alert_is_present())
+                alert_text = alert.text
+                logger.error(f"[!] LOGIN ALERT FOUND: {alert_text}")
+                alert.accept()
+                self.save_debug_files("login_alert")
+                return False
+            except TimeoutException:
+                logger.info("[*] No alert detected")
+            except Exception as e:
+                logger.error(f"[!] Alert check failed: {e}")
+
+            logger.info("[*] Waiting for dashboard...")
+
+            WebDriverWait(self.driver, 25).until(
                 EC.presence_of_element_located((By.ID, "chartContainerHourly"))
             )
-            logger.info("[+] Login successful!")
+
+            logger.info("[+] LOGIN SUCCESSFUL!")
+
             return True
+
         except Exception as e:
             logger.error(f"[!] Login error: {e}")
+            logger.error(traceback.format_exc())
+            logger.error(f"[!] Current URL: {self.driver.current_url}")
+            self.save_debug_files("login_exception")
             return False
 
-    # ─── Data Extraction ───────────────────────────────────────────────────────
+    # =========================================================
+    # EXTRACTION
+    # =========================================================
 
-    def extract_current_day_units(self, ist_day_of_month):
+    def extract_current_day_units(self):
         """
-        Extract today's cumulative units from Highcharts.
+        *** CHANGE 1 vs v3.7 ***
 
-        Two charts exist on the page:
-          Highcharts.charts[?] — current month  ← ALWAYS use this (first non-null)
-          Highcharts.charts[?] — previous month ← NEVER touch this
+        OLD problem: var chart = Highcharts.charts[0]
+          - Highcharts.charts[] can have null slots (destroyed charts)
+          - charts[0] could be null, OR could be the previous-month chart
+          - When null: JS returns null → Python returns 0.0 silently
+          - When previous-month chart: returns wrong month's data
 
-        Highcharts.charts[] can contain null slots (destroyed charts
-        leave null gaps), so we walk the array and grab the FIRST
-        non-null entry — which is always the current month chart.
-
-        Primary  : IST day-of-month as bar index
-        Fallback : last non-zero bar in the SAME first chart only
+        FIX: Walk the array, pick first non-null entry = always current month.
+             Fallback to last non-zero bar stays in the SAME chart object.
+             Returns a result object so logs show exactly which chart/bar was used.
         """
         try:
+            ist_now      = self.get_ist_now()
+            day_of_month = ist_now.day
+
+            logger.info(f"[*] IST day of month: {day_of_month}")
+
             script = """
-                // Step 1: find first non-null chart (= current month chart)
-                var chart = null;
+                var dayIndex = arguments[0] - 1;  /* IST day is 1-based */
+
+                /* ── Step 1: find first non-null chart = current month ── */
+                var chart      = null;
                 var chartIndex = -1;
                 for (var i = 0; i < Highcharts.charts.length; i++) {
-                    if (Highcharts.charts[i] !== null &&
-                        Highcharts.charts[i] !== undefined) {
+                    if (Highcharts.charts[i] != null) {
                         chart      = Highcharts.charts[i];
                         chartIndex = i;
                         break;
@@ -269,30 +389,37 @@ class UPPCLEnhancedTracker:
                 }
 
                 var data = chart.series[0].data;
-                var idx  = arguments[0] - 1;   // IST day_of_month is 1-based
 
-                // Step 2: try IST day index directly
-                if (idx >= 0 && idx < data.length &&
-                    data[idx] && data[idx].y !== null) {
-                    return {value: data[idx].y, source: 'by_day_index',
-                            chartIndex: chartIndex, barIndex: idx};
+                /* ── Step 2: use IST day index (primary) ── */
+                if (dayIndex >= 0 && dayIndex < data.length &&
+                        data[dayIndex] && data[dayIndex].y !== null) {
+                    return {
+                        value: data[dayIndex].y,
+                        source: 'by_ist_day',
+                        chartIndex: chartIndex,
+                        barIndex: dayIndex
+                    };
                 }
 
-                // Step 3: fallback — last non-zero bar in SAME chart only
+                /* ── Step 3: fallback - last non-zero bar in SAME chart ── */
                 for (var j = data.length - 1; j >= 0; j--) {
                     if (data[j] && data[j].y !== null && data[j].y > 0) {
-                        return {value: data[j].y, source: 'fallback_last_bar',
-                                chartIndex: chartIndex, barIndex: j};
+                        return {
+                            value: data[j].y,
+                            source: 'fallback_last_bar',
+                            chartIndex: chartIndex,
+                            barIndex: j
+                        };
                     }
                 }
 
                 return {value: null, source: 'no_data', chartIndex: chartIndex};
             """
 
-            result = self.driver.execute_script(script, ist_day_of_month)
+            result = self.driver.execute_script(script, day_of_month)
 
             if result is None:
-                logger.warning("[!] Highcharts JS returned None — chart not loaded?")
+                logger.warning("[!] Highcharts JS returned None")
                 return 0.0
 
             chart_idx = result.get('chartIndex', -1)
@@ -301,9 +428,16 @@ class UPPCLEnhancedTracker:
             value     = result.get('value')
 
             logger.info(
-                f"[*] Chart: chartIndex={chart_idx}, barIndex={bar_idx}, "
-                f"source={source}, value={value}"
+                f"[*] Chart result → chartIndex={chart_idx}, "
+                f"barIndex={bar_idx}, source={source}, value={value}"
             )
+
+            # Warn if we landed on chart index > 0 (unexpected - should be 0)
+            if chart_idx > 0:
+                logger.warning(
+                    f"[!] WARNING: picked chartIndex={chart_idx} "
+                    f"(expected 0). Check if charts order changed!"
+                )
 
             if value is not None and float(value) >= 0:
                 logger.info(f"[+] Current day units: {value} kWh")
@@ -313,301 +447,305 @@ class UPPCLEnhancedTracker:
             return 0.0
 
         except Exception as e:
-            logger.error(f"[!] Units extraction error: {e}")
+            logger.error(f"[!] Extraction error: {e}")
+            logger.error(traceback.format_exc())
             return 0.0
 
+    def extract_last_reading(self):
+
+        try:
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            match = re.search(
+                r'Last Reading As on (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})',
+                soup.get_text()
+            )
+            return match.group(1) if match else "N/A"
+        except Exception:
+            return "N/A"
+
+    def extract_balance(self):
+
+        try:
+            soup = BeautifulSoup(self.driver.page_source, 'html.parser')
+            match = re.search(
+                r'Grid Bal:\s*Rs\.\s*([\d,]+\.?\d*)',
+                soup.get_text()
+            )
+            return match.group(1) if match else "N/A"
+        except Exception:
+            return "N/A"
+
     def extract_source(self):
+
         try:
             soup = BeautifulSoup(self.driver.page_source, 'html.parser')
             h1 = soup.find('h1', class_='clearfix')
             if h1:
-                m = re.search(r'Source\s*:\s*(\w+)', h1.get_text(), re.IGNORECASE)
-                if m:
-                    logger.info(f"[+] Source: {m.group(1)}")
-                    return m.group(1)
+                match = re.search(
+                    r'Source\s*:\s*(\w+)',
+                    h1.get_text(),
+                    re.IGNORECASE
+                )
+                if match:
+                    return match.group(1)
             return "Unknown"
-        except Exception as e:
-            logger.error(f"[!] Source error: {e}")
+        except Exception:
             return "Unknown"
 
-    def extract_last_reading(self):
-        try:
-            text = BeautifulSoup(self.driver.page_source, 'html.parser').get_text()
-            m = re.search(r'Last Reading As on (\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})', text)
-            if m:
-                logger.info(f"[+] Last reading: {m.group(1)}")
-                return m.group(1)
-            return "N/A"
-        except Exception as e:
-            logger.error(f"[!] Last reading error: {e}")
-            return "N/A"
+    # =========================================================
+    # CALCULATIONS
+    # =========================================================
 
-    def extract_balance(self):
-        try:
-            text = BeautifulSoup(self.driver.page_source, 'html.parser').get_text()
-            m = re.search(r'Updated Balance\s*:\s*Grid Bal:\s*Rs\.\s*([\d,]+\.?\d*)', text)
-            if m:
-                logger.info(f"[+] Balance: ₹{m.group(1)}")
-                return m.group(1)
-            return "N/A"
-        except Exception as e:
-            logger.error(f"[!] Balance error: {e}")
-            return "N/A"
+    def calculate_hourly_consumption(self, current_units, last_hour_units):
 
-    # ─── Hourly Consumption ────────────────────────────────────────────────────
+        if last_hour_units is None or last_hour_units == 0:
+            return 0.0
 
-    def get_last_hour_units(self, ist_today_str):
+        return max(0.0, current_units - last_hour_units)
+
+    def get_last_hour_units(self):
         """
-        Get units value from last row in Today's sheet.
-        FIX: Filter rows by IST date string to avoid picking up
-        yesterday's last row during 00:00 window.
+        *** CHANGE 2 vs v3.7 ***
+
+        OLD problem: returns all_rows[-1][2] blindly
+          - At IST 00:00 (midnight), Today sheet still has yesterday's rows
+            (archive runs AFTER this call)
+          - all_rows[-1] = yesterday's 23:xx row → last_hour_units = wrong value
+          - hourly_consumption = today's 00:xx units - yesterday's 23:xx units
+            = large negative → clamped to 0. Or if yesterday was higher, garbage.
+
+        FIX: Filter rows by today's IST date string before picking the last one.
+             If no row exists for today yet → return 0.0 (correct: day just started).
         """
         try:
-            ws = self.worksheets['today']
-            all_rows = ws.get_all_values()
+            ist_now        = self.get_ist_now()
+            ist_today_str  = ist_now.strftime('%Y-%m-%d')  # e.g. "2026-05-30"
+
+            all_rows = self.worksheets['today'].get_all_values()
 
             if len(all_rows) <= 1:
-                logger.info("[*] No previous records in Today sheet — first run of the day")
+                logger.info("[*] Today sheet empty — first run, last_hour_units = 0.0")
                 return 0.0
 
-            # Walk backwards through data rows, find last row for IST today
+            # Walk backwards; pick last row whose timestamp starts with today's date
             for row in reversed(all_rows[1:]):
-                if not row or not row[0]:
-                    continue
-                if row[0].startswith(ist_today_str):      # same IST date
+                if row and row[0].startswith(ist_today_str):
                     val = float(row[2]) if row[2] else 0.0
                     logger.info(f"[*] Last hour units ({row[0]}): {val} kWh")
                     return val
 
-            # No row for today yet → first entry of the day, start from 0
-            logger.info("[*] No row for IST today yet — treating as day start (0.0)")
+            # No row for today yet (e.g. just after midnight before first write)
+            logger.info("[*] No row for IST today yet — last_hour_units = 0.0")
             return 0.0
 
         except Exception as e:
-            logger.error(f"[!] get_last_hour_units error: {e}")
+            logger.error(f"[!] Last hour fetch error: {e}")
             return 0.0
 
-    def calculate_hourly_consumption(self, current_units, last_hour_units, ist_hour):
-        """
-        Hourly consumption = current - last.
-        Special case: hour 0 (midnight IST) resets to 0.
-        """
-        if ist_hour == 0:
-            logger.info("[*] Midnight reset — hourly consumption = 0.0")
-            return 0.0
+    def calculate_benchmark(self, hour_of_day):
 
-        if last_hour_units == 0.0:
-            logger.info("[*] No last-hour reference — consumption shown as 0.0")
-            return 0.0
-
-        consumption = current_units - last_hour_units
-        if consumption < 0:
-            logger.warning(f"[!] Negative consumption ({consumption}) — clamped to 0.0")
-            return 0.0
-
-        logger.info(f"[+] Hourly consumption: {consumption:.3f} kWh")
-        return round(consumption, 3)
-
-    # ─── Benchmark ─────────────────────────────────────────────────────────────
-
-    def calculate_benchmark(self, ist_hour, ist_today):
-        """
-        Average of same hour consumption for last 3 IST days.
-        FIX: was using datetime.now().date() → UTC date → wrong on cloud.
-        Now uses ist_today (datetime.date in IST).
-        """
         try:
-            ws = self.worksheets['this_month']
-            all_rows = ws.get_all_values()
-            consumptions = []
+            this_month_ws = self.worksheets['this_month']
+            consumptions  = []
+            ist_now       = self.get_ist_now()
+            current_date  = ist_now.date()
 
             for days_back in range(1, 4):
-                check_date = ist_today - timedelta(days=days_back)
-                check_str  = check_date.strftime('%Y-%m-%d')
+                check_date = current_date - timedelta(days=days_back)
 
-                for row in all_rows[1:]:
-                    if not row or not row[0]:
-                        continue
-                    if not row[0].startswith(check_str):
-                        continue
+                for row in this_month_ws.get_all_values()[1:]:
                     try:
-                        row_hour = int(row[1])              # Hour column (IST)
-                        if row_hour == ist_hour:
-                            val = float(row[3]) if row[3] and row[3] != 'N/A' else 0.0
-                            if val > 0:
-                                consumptions.append(val)
+                        row_datetime = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S')
+                        if (row_datetime.date() == check_date and
+                                row_datetime.hour == hour_of_day):
+                            consumption = float(row[3])
+                            if consumption > 0:
+                                consumptions.append(consumption)
                     except Exception:
-                        continue
+                        pass
 
             if consumptions:
-                avg = round(sum(consumptions) / len(consumptions), 3)
-                logger.info(f"[+] Benchmark hour {ist_hour}: {avg} kWh ({len(consumptions)} days)")
-                return avg
+                return round(sum(consumptions) / len(consumptions), 2)
 
-            logger.info(f"[*] No benchmark data yet for hour {ist_hour}")
             return None
 
         except Exception as e:
             logger.error(f"[!] Benchmark error: {e}")
             return None
 
-    # ─── Write to Sheets ───────────────────────────────────────────────────────
+    # =========================================================
+    # SHEET APPEND  (unchanged from v3.7)
+    # =========================================================
 
-    def add_row_to_today_sheet(self, ist_now, current_units, hourly_consumption,
-                               last_hour_units, benchmark, last_reading, balance, source):
+    def add_row_to_today_sheet(
+        self, timestamp, hour, current_units, hourly_consumption,
+        last_hour_units, benchmark, last_reading, balance, source
+    ):
         try:
-            above = "YES" if (benchmark and hourly_consumption > benchmark) else "NO"
-
             row = [
-                ist_now.strftime('%Y-%m-%d %H:%M:%S'),   # IST timestamp
-                ist_now.hour,                              # IST hour
+                timestamp,
+                hour,
                 current_units,
                 hourly_consumption,
                 last_hour_units,
-                benchmark if benchmark is not None else "N/A",
-                above,
+                benchmark if benchmark else "N/A",
+                "YES" if benchmark and hourly_consumption > benchmark else "NO",
                 last_reading,
                 balance,
                 source
             ]
 
             self.worksheets['today'].append_row(row)
-            logger.info(f"[+] Row written ✅  {row[0]} | {current_units} kWh | +{hourly_consumption} kWh | Benchmark {benchmark}")
-
-            if above == "YES":
-                logger.info("[⚠️] Consumption ABOVE benchmark!")
-
+            logger.info("[+] Row added to Today sheet")
             return True
 
         except Exception as e:
-            logger.error(f"[!] append_row error: {e}")
+            logger.error(f"[!] Append error: {e}")
+            logger.error(traceback.format_exc())
             return False
 
-    # ─── Archive (end-of-day cleanup) ──────────────────────────────────────────
+    # =========================================================
+    # ARCHIVE  (unchanged from v3.7)
+    # =========================================================
 
-    def archive_old_data(self, ist_today_str):
-        """
-        Move any rows from Today sheet that belong to a PREVIOUS IST date
-        into This Month sheet.
-        FIX: was using datetime.now().date() → UTC date.
-        Now uses ist_today_str directly.
-        """
+    def archive_old_data(self):
+
         try:
-            ws = self.worksheets['today']
-            all_rows = ws.get_all_values()
+            ist_now    = self.get_ist_now()
+            today_date = ist_now.date()
 
-            if len(all_rows) <= 1:
+            today_ws      = self.worksheets['today']
+            this_month_ws = self.worksheets['this_month']
+
+            all_rows = today_ws.get_all_values()
+
+            if not all_rows:
                 return
 
-            to_move = []
-            to_keep = [all_rows[0]]     # header
+            rows_to_move = []
+            rows_to_keep = [all_rows[0]]
 
             for row in all_rows[1:]:
-                if not row or not row[0]:
-                    to_keep.append(row)
-                    continue
-                if row[0].startswith(ist_today_str):
-                    to_keep.append(row)
-                else:
-                    to_move.append(row)
+                try:
+                    row_date = datetime.strptime(row[0], '%Y-%m-%d %H:%M:%S').date()
+                    if row_date < today_date:
+                        rows_to_move.append(row)
+                    else:
+                        rows_to_keep.append(row)
+                except Exception:
+                    rows_to_keep.append(row)
 
-            if to_move:
-                logger.info(f"[*] Archiving {len(to_move)} old rows to This Month...")
-                for row in to_move:
-                    self.worksheets['this_month'].append_row(row)
-
-                ws.clear()
-                ws.append_rows(to_keep)
-                logger.info("[+] Today sheet cleaned up")
+            if rows_to_move:
+                logger.info(f"[*] Archiving {len(rows_to_move)} old rows")
+                for row in rows_to_move:
+                    this_month_ws.append_row(row)
+                today_ws.clear()
+                today_ws.append_rows(rows_to_keep)
+                logger.info("[+] Archive completed")
 
         except Exception as e:
             logger.error(f"[!] Archive error: {e}")
+            logger.error(traceback.format_exc())
 
-    # ─── Main Run ──────────────────────────────────────────────────────────────
+    # =========================================================
+    # MAIN RUN  (unchanged from v3.7)
+    # =========================================================
 
     def run_once(self):
+
         try:
-            # ── Compute IST "now" once, use everywhere ──────────────────────
-            ist_now        = get_ist_now()
-            ist_today      = ist_now.date()
-            ist_today_str  = ist_today.strftime('%Y-%m-%d')
-            ist_hour       = ist_now.hour
-            ist_day_of_month = ist_now.day
+            logger.info("=" * 80)
+            logger.info("UPPCL TRACKER v3.9 START")
+            logger.info("=" * 80)
 
-            logger.info(
-                f"[*] IST now  : {ist_now.strftime('%Y-%m-%d %H:%M:%S %Z')}  "
-                f"(day={ist_day_of_month}, hour={ist_hour})"
-            )
+            ist_now = self.get_ist_now()
+            logger.info(f"[*] IST Time: {ist_now}")
 
-            # ── Drive + scrape ──────────────────────────────────────────────
             self.setup_chrome_driver()
 
-            if not self.login():
-                logger.error("[!] Login failed — aborting")
+            login_success = self.login()
+
+            if not login_success:
+                logger.error("[!] Login failed")
                 return False
 
-            time.sleep(3)       # let chart render
+            current_units       = self.extract_current_day_units()
+            last_hour_units     = self.get_last_hour_units()
+            hourly_consumption  = self.calculate_hourly_consumption(
+                current_units, last_hour_units)
+            benchmark           = self.calculate_benchmark(ist_now.hour)
+            last_reading        = self.extract_last_reading()
+            balance             = self.extract_balance()
+            source              = self.extract_source()
 
-            current_units    = self.extract_current_day_units(ist_day_of_month)
-            last_hour_units  = self.get_last_hour_units(ist_today_str)
-            hourly_consumption = self.calculate_hourly_consumption(
-                current_units, last_hour_units, ist_hour)
-            benchmark        = self.calculate_benchmark(ist_hour, ist_today)
-            last_reading     = self.extract_last_reading()
-            balance          = self.extract_balance()
-            source           = self.extract_source()
-
-            # ── Write ───────────────────────────────────────────────────────
-            ok = self.add_row_to_today_sheet(
-                ist_now, current_units, hourly_consumption,
-                last_hour_units, benchmark, last_reading, balance, source
+            success = self.add_row_to_today_sheet(
+                timestamp          = ist_now.strftime('%Y-%m-%d %H:%M:%S'),
+                hour               = ist_now.hour,
+                current_units      = current_units,
+                hourly_consumption = hourly_consumption,
+                last_hour_units    = last_hour_units,
+                benchmark          = benchmark,
+                last_reading       = last_reading,
+                balance            = balance,
+                source             = source
             )
 
-            if ok:
-                self.archive_old_data(ist_today_str)
-                logger.info("[+] Capture complete ✅")
+            if success:
+                self.archive_old_data()
+                logger.info("[+] Tracker completed successfully")
 
-            return ok
+            return success
 
         except Exception as e:
-            logger.error(f"[!] run_once error: {e}")
+            logger.error(f"[!] Tracker error: {e}")
+            logger.error(traceback.format_exc())
             return False
 
         finally:
-            if self.driver:
-                self.driver.quit()
+            try:
+                if self.driver:
+                    self.driver.quit()
+                    logger.info("[+] Driver closed")
+            except Exception:
+                pass
+            logger.info("=" * 80)
 
 
-# ─── Entry Point ───────────────────────────────────────────────────────────────
+# =========================================================
+# FLASK ROUTES  (unchanged from v3.7)
+# =========================================================
 
-def main():
-    import argparse
+@app.route('/', methods=['GET', 'POST'])
+def trigger():
 
-    env_username = os.getenv('UPPCL_USERNAME', '5573683932')
-    env_password = os.getenv('UPPCL_PASSWORD', '5573683932')
-    env_sheet    = os.getenv('GOOGLE_SHEETS_NAME', 'UPPCL Consumption Tracker')
+    logger.info("[*] HTTP request received")
 
-    p = argparse.ArgumentParser(description='UPPCL Tracker v3.9')
-    p.add_argument('--username',        default=env_username)
-    p.add_argument('--password',        default=env_password)
-    p.add_argument('--sheet',           default=env_sheet)
-    p.add_argument('--service-account', default='service_account.json')
-    p.add_argument('--once',            action='store_true')
-    args = p.parse_args()
+    try:
+        tracker = UPPCLTracker(
+            os.getenv('UPPCL_USERNAME'),
+            os.getenv('UPPCL_PASSWORD'),
+            os.getenv('GOOGLE_SHEETS_NAME', 'UPPCL Consumption Tracker')
+        )
 
-    logger.info("=" * 60)
-    logger.info("[*] UPPCL Tracker v3.9 — IST-safe, all bugs fixed")
-    logger.info(f"[*] Current IST time: {get_ist_now().strftime('%Y-%m-%d %H:%M:%S %Z')}")
-    logger.info("=" * 60)
+        tracker.init_google_sheets()
 
-    tracker = UPPCLEnhancedTracker(
-        args.username, args.password, args.sheet, args.service_account)
+        success = tracker.run_once()
 
-    tracker.init_google_sheets()
+        if success:
+            return jsonify({'status': 'success'}), 200
 
-    if args.once:
-        tracker.run_once()
+        return jsonify({'status': 'error'}), 500
 
+    except Exception as e:
+        logger.error(f"[!] Fatal Error: {e}")
+        logger.error(traceback.format_exc())
+        return jsonify({'status': 'error', 'message': str(e)}), 500
+
+
+# =========================================================
+# MAIN  (unchanged from v3.7)
+# =========================================================
 
 if __name__ == '__main__':
-    main()
+    port = int(os.getenv('PORT', 8080))
+    app.run(host='0.0.0.0', port=port, debug=False, threaded=True)
