@@ -1,19 +1,45 @@
 #!/usr/bin/env python3
 """
-UPPCL Tracker v3.9 - Based on last working v3.7
-Only 2 changes made on top of working code:
+UPPCL Tracker v4.0 - Based on working v3.9
 
-CHANGE 1: extract_current_day_units()
-  - OLD: Highcharts.charts[0]  ← hardcoded, can be null or previous-month chart
-  - NEW: Walk Highcharts.charts[], find first non-null = always current month chart
-  - Also returns debug info (chartIndex, barIndex, source) in logs
+ROOT-CAUSE FIX for "LOGIN ALERT FOUND: Invalid Captcha Token"
+that ONLY occurs between 00:00 and 05:30 IST on Cloud Run.
 
-CHANGE 2: get_last_hour_units()
-  - OLD: Returns all_rows[-1] blindly ← at midnight returns YESTERDAY's last row
-  - NEW: Filters rows by today's IST date string first, then picks last matching row
-         If no row for today yet → returns 0.0 (correct: fresh day start)
+WHY IT HAPPENED
+---------------
+Cloud Run containers run in UTC. Chrome inherits that, so the login
+page's JavaScript generates its captcha *token* using a UTC-based date.
+The Xenius/UPPCL server validates that token against IST (UTC+5:30).
 
-Everything else is IDENTICAL to the last working v3.7 code.
+  - IST 05:30-23:59  ==  UTC 00:00-18:29  -> same calendar date -> token OK
+  - IST 00:00-05:29  ==  UTC 18:30-23:59 (PREVIOUS day) -> browser date is
+    D-1 while server date is D -> token date mismatch -> "Invalid Captcha Token"
+
+That 5.5h window is exactly "UTC is still yesterday".
+
+THE FIX (CHANGE A - new in v4.0)
+--------------------------------
+Force the browser to Asia/Kolkata BEFORE it loads the page, two ways:
+  1. Set TZ=Asia/Kolkata at process start so the Chrome subprocess
+     inherits IST for new Date().
+  2. CDP Emulation.setTimezoneOverride as an authoritative per-session
+     override applied right after the driver starts (before any get()).
+Plus a verify-timezone log so you can confirm IST in Cloud Run logs.
+
+NOTE: os.environ['TZ'] does NOT affect datetime.now(IST) calls in this
+script (those are pytz tz-aware and independent of system TZ), so there
+is no regression to the IST logic.
+
+ALSO RETAINED / TIGHTENED
+-------------------------
+CHANGE 1 (extract_current_day_units): walk Highcharts.charts[] to the
+  first non-null chart (current month). TIGHTENED so that when today's
+  bar genuinely does not exist yet (portal day not rolled), it returns
+  0.0 with an explicit source instead of silently leaking yesterday's
+  full-day bar via the old fallback.
+
+CHANGE 2 (get_last_hour_units): filter Today-sheet rows by today's IST
+  date before picking the last one; returns 0.0 on a fresh day.
 """
 
 import json
@@ -25,6 +51,17 @@ import subprocess
 import traceback
 from datetime import datetime, timedelta
 import pytz
+
+# =========================================================
+# CHANGE A (part 1): force process timezone to IST at import,
+# BEFORE Chrome is ever launched, so the Chrome subprocess
+# inherits TZ=Asia/Kolkata for its JavaScript new Date().
+# =========================================================
+os.environ['TZ'] = 'Asia/Kolkata'
+try:
+    time.tzset()  # Unix only (Cloud Run is Linux) - no-op safe-guarded on Windows
+except AttributeError:
+    pass
 
 from flask import Flask, jsonify
 import gspread
@@ -70,7 +107,7 @@ class UPPCLTracker:
         return datetime.now(IST)
 
     # =========================================================
-    # GOOGLE SHEETS  (unchanged from v3.7)
+    # GOOGLE SHEETS  (unchanged from v3.9)
     # =========================================================
 
     def init_google_sheets(self):
@@ -150,7 +187,7 @@ class UPPCLTracker:
         worksheet.append_row(headers)
 
     # =========================================================
-    # CHROME DRIVER  (unchanged from v3.7)
+    # CHROME DRIVER
     # =========================================================
 
     def setup_chrome_driver(self):
@@ -200,6 +237,23 @@ class UPPCLTracker:
 
             self.driver.delete_all_cookies()
 
+            # =========================================================
+            # CHANGE A (part 2): authoritative per-session timezone
+            # override via CDP. Applied BEFORE any page is loaded so the
+            # login page's JS sees IST when it builds the captcha token.
+            # =========================================================
+            try:
+                self.driver.execute_cdp_cmd(
+                    "Emulation.setTimezoneOverride",
+                    {"timezoneId": "Asia/Kolkata"}
+                )
+                logger.info("[+] CDP timezone override set -> Asia/Kolkata")
+            except Exception as tz_err:
+                # Non-fatal: TZ env (part 1) still applies as a backstop.
+                logger.warning(f"[!] CDP timezone override failed: {tz_err}")
+
+            self._verify_browser_timezone()
+
             logger.info("[+] Chrome WebDriver ready")
 
         except Exception as e:
@@ -207,8 +261,25 @@ class UPPCLTracker:
             logger.error(traceback.format_exc())
             raise
 
+    def _verify_browser_timezone(self):
+        """
+        CHANGE A (part 3): log what timezone / clock the browser actually
+        reports, so you can confirm in Cloud Run logs that the fix took.
+        Expect: tz=Asia/Kolkata and a date string with GMT+0530.
+        """
+        try:
+            self.driver.get("about:blank")
+            tz = self.driver.execute_script(
+                "return Intl.DateTimeFormat().resolvedOptions().timeZone;"
+            )
+            now_str = self.driver.execute_script("return new Date().toString();")
+            logger.info(f"[*] Browser timezone reported: {tz}")
+            logger.info(f"[*] Browser new Date(): {now_str}")
+        except Exception as e:
+            logger.warning(f"[!] Timezone verify failed (non-fatal): {e}")
+
     # =========================================================
-    # CAPTCHA  (unchanged from v3.7)
+    # CAPTCHA  (unchanged logic from v3.9)
     # =========================================================
 
     def solve_captcha(self):
@@ -247,7 +318,7 @@ class UPPCLTracker:
             return False
 
     # =========================================================
-    # DEBUG  (unchanged from v3.7)
+    # DEBUG  (unchanged from v3.9)
     # =========================================================
 
     def save_debug_files(self, prefix="debug"):
@@ -269,7 +340,7 @@ class UPPCLTracker:
             logger.error(f"[!] Failed saving debug files: {e}")
 
     # =========================================================
-    # LOGIN  (unchanged from v3.7)
+    # LOGIN  (unchanged from v3.9)
     # =========================================================
 
     def login(self):
@@ -352,17 +423,20 @@ class UPPCLTracker:
 
     def extract_current_day_units(self):
         """
-        *** CHANGE 1 vs v3.7 ***
+        CHANGE 1 (tightened in v4.0):
 
-        OLD problem: var chart = Highcharts.charts[0]
-          - Highcharts.charts[] can have null slots (destroyed charts)
-          - charts[0] could be null, OR could be the previous-month chart
-          - When null: JS returns null → Python returns 0.0 silently
-          - When previous-month chart: returns wrong month's data
+        Walk Highcharts.charts[] to the first non-null chart (current month).
+        Then:
+          - if today's bar (by IST day index) has a value -> use it
+          - if the slot exists but is empty -> 0.0 (fresh day, source today_bar_empty)
+          - if the IST day index is beyond data.length -> today's bar not created
+            yet by the portal (UTC-day lag in 00:00-05:30 IST) -> 0.0
+            (source today_bar_missing_utc_lag)
 
-        FIX: Walk the array, pick first non-null entry = always current month.
-             Fallback to last non-zero bar stays in the SAME chart object.
-             Returns a result object so logs show exactly which chart/bar was used.
+        This deliberately removes the old "fallback to last non-zero bar"
+        behaviour that silently leaked YESTERDAY's full-day total during the
+        early-morning window. A missing today-bar means zero consumed so far
+        today, not yesterday's total.
         """
         try:
             ist_now      = self.get_ist_now()
@@ -373,7 +447,7 @@ class UPPCLTracker:
             script = """
                 var dayIndex = arguments[0] - 1;  /* IST day is 1-based */
 
-                /* ── Step 1: find first non-null chart = current month ── */
+                /* Step 1: find first non-null chart = current month */
                 var chart      = null;
                 var chartIndex = -1;
                 for (var i = 0; i < Highcharts.charts.length; i++) {
@@ -390,30 +464,36 @@ class UPPCLTracker:
 
                 var data = chart.series[0].data;
 
-                /* ── Step 2: use IST day index (primary) ── */
-                if (dayIndex >= 0 && dayIndex < data.length &&
-                        data[dayIndex] && data[dayIndex].y !== null) {
+                /* Step 2: today's bar by IST day index */
+                if (dayIndex >= 0 && dayIndex < data.length) {
+                    if (data[dayIndex] && data[dayIndex].y !== null) {
+                        return {
+                            value: data[dayIndex].y,
+                            source: 'by_ist_day',
+                            chartIndex: chartIndex,
+                            barIndex: dayIndex,
+                            dataLength: data.length
+                        };
+                    }
+                    /* slot exists but empty -> fresh day, no consumption yet */
                     return {
-                        value: data[dayIndex].y,
-                        source: 'by_ist_day',
+                        value: 0,
+                        source: 'today_bar_empty',
                         chartIndex: chartIndex,
-                        barIndex: dayIndex
+                        barIndex: dayIndex,
+                        dataLength: data.length
                     };
                 }
 
-                /* ── Step 3: fallback - last non-zero bar in SAME chart ── */
-                for (var j = data.length - 1; j >= 0; j--) {
-                    if (data[j] && data[j].y !== null && data[j].y > 0) {
-                        return {
-                            value: data[j].y,
-                            source: 'fallback_last_bar',
-                            chartIndex: chartIndex,
-                            barIndex: j
-                        };
-                    }
-                }
-
-                return {value: null, source: 'no_data', chartIndex: chartIndex};
+                /* Step 3: IST day index beyond data -> portal day not rolled
+                   (UTC-midnight lag during 00:00-05:30 IST). NOT yesterday. */
+                return {
+                    value: 0,
+                    source: 'today_bar_missing_utc_lag',
+                    chartIndex: chartIndex,
+                    barIndex: dayIndex,
+                    dataLength: data.length
+                };
             """
 
             result = self.driver.execute_script(script, day_of_month)
@@ -422,14 +502,16 @@ class UPPCLTracker:
                 logger.warning("[!] Highcharts JS returned None")
                 return 0.0
 
-            chart_idx = result.get('chartIndex', -1)
-            source    = result.get('source', '')
-            bar_idx   = result.get('barIndex', -1)
-            value     = result.get('value')
+            chart_idx  = result.get('chartIndex', -1)
+            source     = result.get('source', '')
+            bar_idx    = result.get('barIndex', -1)
+            value      = result.get('value')
+            data_len   = result.get('dataLength', -1)
 
             logger.info(
-                f"[*] Chart result → chartIndex={chart_idx}, "
-                f"barIndex={bar_idx}, source={source}, value={value}"
+                f"[*] Chart result -> chartIndex={chart_idx}, "
+                f"barIndex={bar_idx}, dataLength={data_len}, "
+                f"source={source}, value={value}"
             )
 
             # Warn if we landed on chart index > 0 (unexpected - should be 0)
@@ -439,11 +521,17 @@ class UPPCLTracker:
                     f"(expected 0). Check if charts order changed!"
                 )
 
+            if source == 'today_bar_missing_utc_lag':
+                logger.info(
+                    "[*] Today's bar not present yet (early-morning UTC lag). "
+                    "Reporting 0.0 current-day units."
+                )
+
             if value is not None and float(value) >= 0:
                 logger.info(f"[+] Current day units: {value} kWh")
                 return float(value)
 
-            logger.warning("[!] No usable chart value — returning 0.0")
+            logger.warning("[!] No usable chart value - returning 0.0")
             return 0.0
 
         except Exception as e:
@@ -505,37 +593,28 @@ class UPPCLTracker:
 
     def get_last_hour_units(self):
         """
-        *** CHANGE 2 vs v3.7 ***
+        CHANGE 2 (unchanged from v3.9):
 
-        OLD problem: returns all_rows[-1][2] blindly
-          - At IST 00:00 (midnight), Today sheet still has yesterday's rows
-            (archive runs AFTER this call)
-          - all_rows[-1] = yesterday's 23:xx row → last_hour_units = wrong value
-          - hourly_consumption = today's 00:xx units - yesterday's 23:xx units
-            = large negative → clamped to 0. Or if yesterday was higher, garbage.
-
-        FIX: Filter rows by today's IST date string before picking the last one.
-             If no row exists for today yet → return 0.0 (correct: day just started).
+        Filter Today-sheet rows by today's IST date string before picking the
+        last matching row. If no row exists for today yet -> 0.0 (day start).
         """
         try:
             ist_now        = self.get_ist_now()
-            ist_today_str  = ist_now.strftime('%Y-%m-%d')  # e.g. "2026-05-30"
+            ist_today_str  = ist_now.strftime('%Y-%m-%d')
 
             all_rows = self.worksheets['today'].get_all_values()
 
             if len(all_rows) <= 1:
-                logger.info("[*] Today sheet empty — first run, last_hour_units = 0.0")
+                logger.info("[*] Today sheet empty - first run, last_hour_units = 0.0")
                 return 0.0
 
-            # Walk backwards; pick last row whose timestamp starts with today's date
             for row in reversed(all_rows[1:]):
                 if row and row[0].startswith(ist_today_str):
                     val = float(row[2]) if row[2] else 0.0
                     logger.info(f"[*] Last hour units ({row[0]}): {val} kWh")
                     return val
 
-            # No row for today yet (e.g. just after midnight before first write)
-            logger.info("[*] No row for IST today yet — last_hour_units = 0.0")
+            logger.info("[*] No row for IST today yet - last_hour_units = 0.0")
             return 0.0
 
         except Exception as e:
@@ -574,7 +653,7 @@ class UPPCLTracker:
             return None
 
     # =========================================================
-    # SHEET APPEND  (unchanged from v3.7)
+    # SHEET APPEND  (unchanged from v3.9)
     # =========================================================
 
     def add_row_to_today_sheet(
@@ -605,7 +684,7 @@ class UPPCLTracker:
             return False
 
     # =========================================================
-    # ARCHIVE  (unchanged from v3.7)
+    # ARCHIVE  (unchanged from v3.9)
     # =========================================================
 
     def archive_old_data(self):
@@ -648,14 +727,14 @@ class UPPCLTracker:
             logger.error(traceback.format_exc())
 
     # =========================================================
-    # MAIN RUN  (unchanged from v3.7)
+    # MAIN RUN  (unchanged from v3.9)
     # =========================================================
 
     def run_once(self):
 
         try:
             logger.info("=" * 80)
-            logger.info("UPPCL TRACKER v3.9 START")
+            logger.info("UPPCL TRACKER v4.0 START")
             logger.info("=" * 80)
 
             ist_now = self.get_ist_now()
@@ -712,7 +791,7 @@ class UPPCLTracker:
 
 
 # =========================================================
-# FLASK ROUTES  (unchanged from v3.7)
+# FLASK ROUTES  (unchanged from v3.9)
 # =========================================================
 
 @app.route('/', methods=['GET', 'POST'])
@@ -743,7 +822,7 @@ def trigger():
 
 
 # =========================================================
-# MAIN  (unchanged from v3.7)
+# MAIN  (unchanged from v3.9)
 # =========================================================
 
 if __name__ == '__main__':
